@@ -47,9 +47,11 @@
 | `arm-mechanism-photogrammetry` | 相机实测反解机构参数（offset/scale/reverse/限位） |
 | `arm-robot-serial` | 串口链路陷阱（Uno 静默窗口、首条指令丢弃、ACK 门控、非重叠 I/O） |
 | `arm-ws-joint-link` | 关节级 WS 闭环（回执=目标角、latest-wins、量化下限、重连补发） |
+| `arm-backend-new-ingress` | **新增入口**（TCP/API/MQTT…）只当 adapter：只调 `controller.Apply`、几何从 robot.yaml 推导、冻结基线当判据、`Close()` 先关活连接 |
 | **`armpilot-workspace`**（本工程） | 导航 + 跨项目铁律 + 路由表（**入口**） |
 
-三者各管一段、无重叠：机构（几何真值）→ 串口（字节链路）→ WS（语义链路）。
+四者各管一段、无重叠：机构（几何真值）→ 串口（字节链路）→ WS（语义链路）→ 新入口（adapter 分层）。
+⚠️ 后端**没有** FK/IK；要 XYZ→关节角时按 `arm-backend-new-ingress` §4 走冻结基线，别自证。
 
 ## 六、文档落点
 

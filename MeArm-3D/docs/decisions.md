@@ -3,7 +3,45 @@
 记录"为什么这么做"，尤其是**与原 spec 示例不一致**的地方，方便后续复盘与修改。
 每条都有编号，代码注释会引用编号（如 `D2`）。
 
-> 本文**最新条目在前**（D81 在最上，D1 在最下）。
+> 本文**最新条目在前**（D82 在最上，D1 在最下）。
+
+## D82 · TCP JSON 控制接口是**第四个入口**，不是第四个控制核心：后端运动学只在新文件里补，几何从 `robot.yaml` 推导，判据用冻结基线
+
+**背景**：需求是给 Go 后端加一个 TCP JSON Lines 控制接口（`move` / `gripper` / `servo`），
+且**最高优先级约束**是"增量、非重构"——既有 HTTP / WebSocket / Serial / Sim / Real /
+IK / FK / 前端行为一律不得改变。
+
+**核心取舍**：新入口唯一的"控制动作"是调用 `controller.Apply(关节角整帧)`。
+限位校验（`Model.Validate`）、ACK 门控、latest-wins 全在 `Apply` 内部，
+绕过它 = 绕过安全门。因此 TCP 层不持有任何角度/尺寸常数：
+
+- 关节限位 → `Model.Validate`（由 `Apply` 调用）
+- 舵机硬件行程 → `Actuator.Limits`（`robot.yaml` 的 `actuators[].limits`）
+- 几何 → `robot.yaml` 的 `links[].length` 按**关节角色**推导（本机型 `60/80/80/40` mm）
+
+**不得不补的东西**：审计确认后端**原本没有 FK/IK**（WebSocket 是纯关节级协议），
+而 `move` 需要 XYZ→关节角。取舍是把它关进**新文件** `internal/robot/kinematics.go`，
+不动既有 `robot.Load` / `yamlFile`；正确性不以自测自证，而以**冻结基线**
+`robot-package/mearm-v1/tests/cases/{fk,ik}_cases.json` 当独立第三方判据
+（FK 最差 `7.1e-13 mm`、IK 往返 `7.4e-14 mm`、失败分类 6/6、分支 115/115）。
+这与 Sim2Sim「判据只有一份」是同一个思路：Go 是继前端 / Python 之后的第 4 个独立实现。
+
+**相对运动的基准取 command 不取 state**：`move` 若以设备回读的过程值做基准，
+连续 `+X` 会每一步都从"还在斜坡上"的读数再加 ⇒ 永远追不上。与前端
+"能不能跟随 Actual"是同源的坑。
+
+**并发在 adapter 层串行化**（`Handler.mu` 把「读当前→算目标→下发」做成原子），
+不去改 controller 的 latest-wins——这是"不重构"的代价最小化解。
+
+**默认关闭**：`tcp.enabled` 默认 `false`，端口 `9100`（避开 8090 / 5273 / 8080 / 9001）。
+
+**验收**（真实机器未安装 ⇒ 只能 sim / mujoco）：TCP 冒烟 sim **28/28** · mujoco **28/28**；
+设备跟随 sim **23/23** · mujoco **22/22**；前端 e2e **88/88**（含 Phase 8 真 Go 后端）；
+前端单测 **439/439**；后端 `go test ./...` 全 ok。**前端零改动。**
+
+**已知限制**：无鉴权，假定运行在可信局域网；`move` 只解平面 2R（腕部被动）；
+`state.joints` 返回命令值而非设备过程值（要看到位情况读 WS 的 `origin:"device"` 帧）。
+协议见 `docs/tcp-control-v1.md`。
 
 ## D81 · 三条设备链路对等：`# SERVO` / `origin` 在 sim·mujoco·serial 上同构，并登记两处刻意不对称
 

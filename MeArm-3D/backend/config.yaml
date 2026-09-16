@@ -13,6 +13,17 @@ web:
   ping_interval_ms: 15000  # 传输层 ping 间隔（浏览器会自动回 pong）
   client_timeout_ms: 40000 # 静默超过此值判链路已死并断开
 
+# TCP JSON Lines 控制接口（`internal/tcpserver`）—— 第四个入口。
+# 它与上面的 HTTP / WebSocket **并行**、互不替换：只多占一个端口，
+# 收到的 JSON 一律转成现有 `controller.Apply`（关节角整帧）。
+# 协议与命令见 docs/tcp-control-v1.md。
+tcp:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9100             # 避开 8090(HTTP/WS) · 5273(vite) · 8080/9001(RemoteControl)
+  max_line_bytes: 65536 # 单行上限；超长只断开那一条连接，不影响进程
+  read_timeout_ms: 0    # 0 = 不设读超时（客户端可以长时间连着不说话）
+
 robot:
   # 模型**选择器**（config/robots.yaml）—— 它只回答"该加载哪台机器人"，
   # 路径不存在时按 ../config/robots.yaml → config/robots.yaml → ../MeArm-3D/config/robots.yaml 回退。

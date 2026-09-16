@@ -27,6 +27,15 @@ web:
   ping_interval_ms: 15000
   client_timeout_ms: 40000
 
+# TCP JSON Lines 控制接口（第四个入口，与 HTTP / WebSocket 并行）。
+# 协议与命令见 docs/tcp-control-v1.md。
+tcp:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9100
+  max_line_bytes: 65536
+  read_timeout_ms: 0
+
 robot:
   # 模型**选择器**。三端（Go / Python / 前端）共用同一份声明 ——
   # 各按自己的 default 猜，就会出现"限位在 Go 侧用 A 的、在 Python 侧用 B 的"。

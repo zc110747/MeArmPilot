@@ -20,6 +20,7 @@ import (
 // Config 后端运行配置。
 type Config struct {
 	Web     WebConfig     `yaml:"web"`
+	Tcp     TcpConfig     `yaml:"tcp"`
 	Robot   RobotConfig   `yaml:"robot"`
 	Device  DeviceConfig  `yaml:"device"`
 	Control ControlConfig `yaml:"control"`
@@ -36,6 +37,23 @@ type WebConfig struct {
 	PingIntervalMs int `yaml:"ping_interval_ms"`
 	// ClientTimeoutMs 浏览器静默多久判死
 	ClientTimeoutMs int `yaml:"client_timeout_ms"`
+}
+
+// TcpConfig TCP JSON Lines 控制接口（`internal/tcpserver`）。
+//
+// 它是**新增的第四个控制入口**，与 HTTP / WebSocket / Serial 并行、互不替换。
+// ⚠️ 默认 `enabled: false` —— 不写这一段就完全不监听，现有链路一行都不受影响。
+//
+// 端口刻意避开已在用的：8090（HTTP/WS）、5273（vite dev）、
+// 8080 / 9001（MeArm-RemoteControl 子项目）。
+type TcpConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Host    string `yaml:"host"`
+	Port    int    `yaml:"port"`
+	// MaxLineBytes 单行上限（≤0 = 64KB）。超长只断那一个连接，不动进程。
+	MaxLineBytes int `yaml:"max_line_bytes"`
+	// ReadTimeoutMs 读行超时（0 = 不限）。用来回收僵死连接。
+	ReadTimeoutMs int `yaml:"read_timeout_ms"`
 }
 
 // RobotConfig 指向模型真值文件。
@@ -143,6 +161,8 @@ func Default() Config {
 			Host: "0.0.0.0", Port: 8090, Path: "/ws/joint",
 			PingIntervalMs: 15000, ClientTimeoutMs: 40000,
 		},
+		// TCP 接口默认**关闭**：它是新增入口，不该在没人用的时候占端口。
+		Tcp:   TcpConfig{Enabled: false, Host: "0.0.0.0", Port: 9100},
 		Robot: RobotConfig{SelectorPath: "../config/robots.yaml"},
 		Device: DeviceConfig{
 			Mode: "sim",
@@ -180,6 +200,9 @@ func Load(path string) (Config, error) {
 	}
 	if c.Web.Port <= 0 {
 		c.Web.Port = 8090
+	}
+	if c.Tcp.Port <= 0 {
+		c.Tcp.Port = 9100
 	}
 	if c.Device.Mode == "" {
 		c.Device.Mode = "sim"

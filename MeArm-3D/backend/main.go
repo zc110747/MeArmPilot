@@ -27,6 +27,7 @@ import (
 	"armpilot/backend/internal/controller"
 	"armpilot/backend/internal/device"
 	"armpilot/backend/internal/robot"
+	"armpilot/backend/internal/tcpserver"
 	"armpilot/backend/internal/wsserver"
 )
 
@@ -188,6 +189,34 @@ func run(cfgPath, robotIDFlag string) error {
 
 	log.Printf("就绪：浏览器连接 %s", srv.URL())
 	log.Printf("健康检查: http://%s/healthz", srv.Addr())
+
+	// ---- TCP JSON 控制接口（第四个入口，与 HTTP / WebSocket **并行**）--------
+	//
+	// 它只做"协议 → controller.Apply"的转换：不碰 device、不碰 IK 之外的控制逻辑，
+	// 也不替换任何现有入口。默认关闭（配置 `tcp.enabled`），打开后只是多占一个端口。
+	//
+	// ⚠️ 运动学（FK/IK）由 `robot.LoadGeom` 从**同一份 robot.yaml** 求导，
+	//    限位仍由 `controller.Apply → Model.Validate` 把关 —— 没有第二份真值。
+	if c.Tcp.Enabled {
+		geom, gerr := robot.LoadGeom(entry.ConfigPath)
+		if gerr != nil {
+			return gerr
+		}
+		tcpSrv := tcpserver.New(tcpserver.Config{
+			Host:          c.Tcp.Host,
+			Port:          c.Tcp.Port,
+			MaxLineBytes:  c.Tcp.MaxLineBytes,
+			ReadTimeoutMs: c.Tcp.ReadTimeoutMs,
+		}, tcpserver.NewHandler(ctl, model, geom))
+		go func() {
+			// 监听失败**只记日志**：它不该把已经跑起来的 HTTP / WebSocket 一起拖下水。
+			if err := tcpSrv.ListenAndServe(); err != nil {
+				log.Printf("[tcp] 服务停止: %v", err)
+			}
+		}()
+		defer tcpSrv.Close()
+		log.Printf("TCP 控制接口: %s（JSON Lines 一行一命令；cmd = move / gripper / servo）", tcpSrv.Addr())
+	}
 
 	// ---- 等待退出 ----------------------------------------------------------
 	sig := make(chan os.Signal, 1)
