@@ -30,6 +30,14 @@ device:
   #
   # 三者的**上层完全一致**：controller 独占限位/标定与 ACK 门控，
   # WebSocket 与前端一行都不用改。
+  #
+  # ★ 三条链路各有一份 **mode 不同** 的配置，跑的是同一套代码：
+  #     config.yaml         → sim    （本文件，默认；不碰硬件、无额外依赖）
+  #     config.mujoco.yaml  → mujoco （需装好 mujoco 的 python，见下方 mujoco.python）
+  #     config.serial.yaml  → serial （需真机；会**真的动**）
+  #   三者共用 8090 端口 ⇒ **不能同时启动**，切换只需换 `-c` 的参数：
+  #     ./bin/armpilot-backend.exe -c config.mujoco.yaml
+  #   配套验收：core/tools/verify_device_follow.mjs --config {sim|mujoco|serial}
   mode: "sim"
   sim:
     max_servo_speed: 240   # 舵机最大角速度（度/秒）；0 = 瞬时到位。与前端 Mock 默认一致
@@ -41,10 +49,18 @@ device:
     # ⚠️ 这里**只有运行参数**。质量/惯量/摩擦/增益在 robot-package/mearm-v1/physics/physics.yaml，
     #    限位与标定在 robot-package/mearm-v1/model/robot.yaml —— 一个都不许抄到这里来。
     #
-    # Python 解释器：必须指向**装了 mujoco 包**的那一个，否则启动握手会失败
+    # Python 解释器：**必须指向装了 mujoco 包**的那一个，否则启动握手会失败
     # （错误信息里会直接提示，不会表现为"设备可用但没有回执"）。
-    # 本机可用值（隔离环境，py3.13 + mujoco 3.13 + numpy + pyyaml）：
-    python: "C:/Users/lx176/.workbuddy/binaries/python/envs/default/Scripts/python.exe"
+    #
+    # ⚠️ 留空即可，**不要**在这里写本机绝对路径 —— 那是换机器即失效的写法
+    #    （本项目的既有态度见 cfg.ResolveMujocoScript 的注释）。留空时的解析顺序：
+    #      ① 环境变量 ARMPILOT_MUJOCO_PYTHON（临时切换 / CI 用，不必改被跟踪的文件）
+    #      ② <用户目录>/.workbuddy/binaries/python/envs/default 下的隔离环境
+    #         （Scripts/python.exe · bin/python —— 相对位置，换用户名照样成立）
+    #      ③ PATH 里的 python
+    #    本机可用值（隔离环境，py3.13 + mujoco 3.13 + numpy + pyyaml）：
+    #      C:/Users/<you>/.workbuddy/binaries/python/envs/default/Scripts/python.exe
+    python: ""
     # 留空 = 按 ../simulation/mujoco/server.py → simulation/... 依次回退
     script: ""
     report_hz: 30          # STATE 上报频率（Hz）

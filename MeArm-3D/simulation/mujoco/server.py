@@ -6,6 +6,10 @@
 
     ── 下行（Go → 本进程）────────────────────────────────────────────
       JR <j1> <j2> <j3> <grip>     关节角整帧命令（位次 = JointOrder）
+      SET <id> <ang> [<id> <ang>…] 直接设定舵机角（≤3 组，固件 `SET` 语义）
+      S<id>=<ang>                  `SET` 的简写（id 只能 6..9）
+      JOY <id> <raw>               单轴摇杆拨动（raw 0..1023）
+      JOY <r9> <r8> <r6> <r7>      整帧摇杆（位次与固件一致）
       STATUS | STATE?              查询舵机角（整数）
       RESET                        全部舵机回 90°（= HOME，不是"关节全 0"）
       PING                         心跳
@@ -14,6 +18,8 @@
     ── 上行（本进程 → Go）────────────────────────────────────────────
       OK JR S9=.. S8=.. S7=.. S6=..   受理回执（**目标**舵机角，2 位小数）
       STATE <j1> <j2> <j3> <grip>     **实际**关节角主动上报（2 位小数）
+      # SERVO S9=.. S8=.. S7=.. S6=.. **实际**舵机角异步上报（设备侧自主变化）
+      OK SET … / OK JOY …             舵机级指令受理回执（**钳位后目标角**，整数）
       STATUS S9=.. S7=.. S8=.. S6=..  舵机角查询应答（整数）
       OK RESET / OK PING
       ERR JOINT <id> <v> (limit <min>..<max>)
@@ -23,21 +29,48 @@
 于是 WebSocket / controller / protocol / 前端**全部零改动**，接入点只是
 `backend/main.go` 的 device 工厂多一个 case（spec §2 / §25 / §40）。
 
+# 两条上报路径（这是"上位机状态跟随"的关键，别把它们混成一条）
+
+    JR 受理         → 位置推进 → `STATE …`      关节角，**命令引起**（origin=command）
+    SET/JOY/S<n>=   → 位置推进 → `# SERVO …`    舵机角，**设备侧自主变化**（origin=device）
+
+为什么要分成两条：`JR` 是上位机命令，设备只是在执行 —— 状态跟随命令即可；
+而 `SET` / `JOY` 在本项目里模拟的是**命令之外的改动**（真机上对应硬件摇杆、红外遥控、
+面板手拧、调试直控）。这类改动必须让界面**跟着走**，否则 UI 会停在一个与现场不符的
+姿态上，而且看不出任何异常。
+
+⚠️ 因此不要把 `# SERVO` 也用在 JR 路径上：那会让界面把命令侧一路拖向实际位置，
+   拖滑杆时会看到滑杆被"回拉"（命令语义被跟随语义吃掉）。
+
+⚠️ 三条链路（sim / serial / mujoco）必须**行为一致** —— 判据就是
+   `core/tools/verify_device_follow.mjs` 同一份脚本在三种 `--config` 下全绿。
+
+# 优先级：自主上报让位于命令
+
+`SET`/`JOY` 触发的上报是**低优先级**的：命令在途（`jr_busy`）时只记脏、不发，
+等命令了结后**重新取值**补报（latest-wins，中间帧被合并而不是积压）。
+与固件侧「TX 环为空才发」、Go sim 侧「`jrBusy` 抑制 + `flushReport()`」是同一条规则。
+
 三个时间尺度（spec §23 / §24）—— 三者互相解耦，**渲染帧率不决定物理步长**：
 
     physics  1000 Hz   固定 1ms 步长；唯一推进 `qpos` 的地方
     control   100 Hz   `MeArmSim.step()` 内部按 `_ctrl_accum` 节流（不是每个物理步都改 ctrl）
-    report     30 Hz   只有位置**真的变了**才发 STATE
+    report     30 Hz   只有位置**真的变了**才发 STATE / `# SERVO`
 
-⚠️ `OK JR` 回的是"我打算去哪"（目标），`STATE` 才是"它现在在哪"（实际）。
-这是本项目的一条铁律：MG90S 没有位置回读，任何 `OK`/`STATUS` 都只是意图，
-唯一的外部地面真值是相机（见 docs/decisions.md D34）。
+⚠️ `OK JR` / `OK SET` 回的是"我打算去哪"（目标或钳位后目标），`STATE` / `# SERVO`
+   才是"它现在在哪"（实际）。这是本项目的一条铁律：MG90S 没有位置回读，任何
+   `OK`/`STATUS` 都只是意图，唯一的外部地面真值是相机（见 docs/decisions.md D34）。
+
+⚠️ ★★ `SET` / `JOY` **只改 target**，绝不出现 `qpos[...] = target` 这种直接摆位
+   （spec §12）。这里的 `actual` 永远来自 MuJoCo 物理 —— 这正是它比 Go sim 更值钱的
+   地方：Go sim 要自己写斜坡，这里由物理引擎给出真实响应。
 """
 
 from __future__ import annotations
 
 import argparse
 import queue
+import re
 import sys
 import threading
 import time
@@ -58,6 +91,45 @@ from units import ensure_utf8_stdout  # noqa: E402
 DEFAULT_REPORT_HZ = 30.0
 DEFAULT_PHYS_HZ = 1000.0
 DEFAULT_BATCH_MS = 10.0
+
+#: 固件 `SET` 的多组上限（core/cmd.c `MAX_PAIRS`）。sim 不该比真机宽容。
+MAX_SET_PAIRS = 3
+
+#: `S<id>=<angle>` 简写（固件 cmd.c 的 shorthand，id 只能 6..9）。
+RE_SERVO_SHORTHAND = re.compile(r"^\s*S([6-9])=(-?\d+)\s*$", re.IGNORECASE)
+
+
+def joystick_delta(servo_id: int, raw: int) -> int:
+    """摇杆读数 → 单次拨动步长（度）。与固件 `core/joystick.c::joystick_delta()` **同一条公式**。
+
+    两处必须一致，否则 sim 上"拨一下走多远"与真机会对不上，而验收数字看起来仍然
+    自洽 —— 这是最容易蒙混过去的一类偏差。Go 侧 `sim.go::joystickDelta` 是同一式的
+    第二个实现，三处同值由测试锚定（tests/sim/test_server.py 的公式表）。
+
+        raw < 200 → 一个方向；raw > 800 → 另一方向；中间死区不动（返回 0）
+        id == 8（左舵）方向取反 —— 与原始 Arduino 草图一致
+        步长与推杆深度成比例：min 2、max 10（度）
+
+    ⚠️ 用 `//` 而不是 `/`：`beyond` 恒为非负（见两个分支），此时 Python 的向下取整
+       与 C/Go 的向零取整**同值**。若哪天引入负数，两者会分叉 —— 别改这条前提。
+    """
+    if raw < 0:
+        raw = 0
+    if raw > 1023:
+        raw = 1023
+
+    past_hi = raw > 800
+    past_lo = raw < 200
+    if not past_hi and not past_lo:
+        return 0
+
+    beyond = raw - 800 if past_hi else 200 - raw
+    step = 2 + beyond // 30
+    if step > 10:
+        step = 10
+
+    positive = past_hi if servo_id == 8 else past_lo
+    return step if positive else -step
 
 
 class Emitter:
@@ -105,6 +177,22 @@ class MujocoDevice:
         self._cmds: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
 
+        # external_motion：当前这轮位置推进是否由**设备侧外部手段**引起
+        # （SET / JOY / S<n>=）。决定上报走哪条路（见文件头"两条上报路径"）。
+        # 命令路径（JR / RESET）把它置回 False。
+        self.external_motion = False
+        # jr_busy：是否有命令在途。
+        # ★ 这是本链路的"低优先级"落点：在途期间外部上报**让位**（只记脏、不发）。
+        # ⚠️ 与 Go sim 的差别要说清楚：那边有 `LatencyMs`（15ms）的送达延迟，
+        #    所以窗口是毫秒级、e2e 能撞上；本链路走 stdio，处理是**同步**的，
+        #    窗口是亚毫秒级。因此"让位"这条规则由**单测直接构造在途态**证明，
+        #    e2e 只证可观测后果（与 Go 侧同一纪律，见 playbook §14.10）。
+        self.jr_busy = False
+        # report_dirty：有尚未报出的外部位置变化。
+        # ⚠️ 只记"有没有"，**不缓存数值** —— 补报那一刻才取 current_servo()，
+        #    所以被合并掉的永远是过期帧（latest-wins），既不积压也不补发旧姿态。
+        self.report_dirty = False
+
         # 开机位 = 模型 HOME（四个舵机恰好 90°）。协议 §4 明确 RESET 不许
         # 改成"关节全 0"：关节全 0 对肘（绝对角 108..142）是不可达位姿。
         self.boot_pose: dict[str, float] = dict(self.robot.home_pose)
@@ -128,6 +216,36 @@ class MujocoDevice:
     def encode_state(self, joints: Mapping[str, float]) -> str:
         """`STATE <j1> <j2> <j3> <grip>`（对齐 EncodeState，2 位小数）。"""
         return "STATE " + " ".join(f"{joints[j]:.2f}" for j in self.order)
+
+    def encode_servo_report(self, servo: Mapping[int, float]) -> str:
+        """`# SERVO S9=.. S8=.. S7=.. S6=..`（对齐 `protocol.EncodeServoReport`）。
+
+        语义三条，缺一条就会被误用：
+
+          * `#` 前缀 = **异步事件**。协议 §3 已把 `#` 定为"非应答"，
+            因此它天然不参与命令-应答门控 —— 上层不需要特判，也不该拿它
+            去放行某条在途命令。
+          * 它携带的是设备侧**实际**角度（由 `qpos` 反解），与 `OK JR` 的
+            目标角是两个不同的量。**这是它存在的全部意义**。
+          * 它表达的是**设备自主变化**（摇杆 / 红外 / 手拧 / 调试直控），
+            因此上层据此发布的状态必须标 `origin=device`。
+
+        ⚠️ 通道**降序**（S9 S8 S7 S6）与 Go 侧一致：map 迭代序在语言之间不一样，
+           不固定顺序就没法做逐字节对照，测试也会变成随机失败。
+        """
+        chans = sorted(servo, reverse=True)
+        return "# SERVO " + " ".join(f"S{c}={servo[c]:.2f}" for c in chans)
+
+    def encode_servo_kv(self, prefix: str, servo: Mapping[int, float]) -> str:
+        """编 `OK SET S7=90 S6=88` 这类**应答**行（对齐 `encodeServoKV`，整数）。
+
+        ⚠️ 只用于"我收到了"这种应答，**不要**拿它当状态上报 —— 应答里的角度是
+           目标/钳位值，不是实际位置；状态上报走 `encode_servo_report`。
+        """
+        chans = sorted(servo, reverse=True)
+        if not chans:
+            return prefix
+        return prefix + " " + " ".join(f"S{c}={servo[c]:.0f}" for c in chans)
 
     # ------------------------------------------------------------------
     # 换算
@@ -161,10 +279,27 @@ class MujocoDevice:
 
         if upper.startswith("JR"):
             self._handle_jr(line)
+        # ---- 真机舵机级入口（SET / S<n>= / JOY）--------------------------
+        #
+        # 为什么 MuJoCo 链路也要认这几条**固件级**命令：它们代表"命令之外的改动"。
+        # 真机上对应的是硬件摇杆（`joystick_scan()`）、红外遥控、面板手拧 ——
+        # 都不会经过本机的 JR 通路。把它们做成可下发的命令，是为了让"下位机被
+        # 外部手段改动 → 上位机状态跟随"这条链路在**三种链路**上都能端到端验证，
+        # 而不必等到接上真机才发现界面不动。
+        #
+        # ⚠️ 语义边界：`SET` 在这里**不是** JR 的翻译结果（真机链路里 JR→SET 的翻译
+        #    在 `serial.go`，本进程收到 JR 直接处理，不需要拆 SET）。收到的 SET
+        #    只可能来自调试 / 验收脚本，所以按"外部改动"对待是对的。
+        elif upper.startswith("SET") or RE_SERVO_SHORTHAND.match(line):
+            self._handle_set(line)
+        elif upper.startswith("JOY"):
+            self._handle_joy(line)
         elif upper in ("STATUS", "STATE?"):
             self.out.line(self.encode_status(self.current_servo()))
         elif upper == "RESET":
             self.sim.set_target_joints(self.boot_pose)
+            # RESET 是**命令**路径（上位机要求回中位）⇒ 后续推进走 STATE 上报
+            self.external_motion = False
             self.out.line("OK RESET")
             self.out.line(self.encode_ok_jr(self.joints_to_servo(self.boot_pose)))
         elif upper == "PING":
@@ -205,8 +340,179 @@ class MujocoDevice:
 
         # ③ 受理：只写**目标**。实际位置永远由物理决定 ——
         #    绝不出现 `qpos[...] = target` 这种"直接摆位"（spec §12）。
+        #
+        # ⚠️ 下面两行是"优先级"在本进程里的落点：
+        #   external_motion=False → 本次位置推进用 `STATE` 上报（命令引起）
+        #   jr_busy=True          → 在途期间**外部**上报让位（只记脏、不发）
+        # 与服务端口径一致：交互指令优先，状态上报不许插队。
+        self.external_motion = False
+        self.jr_busy = True
         self.sim.set_target_joints(joints)
         self.out.line(self.encode_ok_jr(servo))
+        self.jr_busy = False
+        # 在途期间被让位掉的外部变化，在这里补报最新值（让位 ≠ 丢弃）
+        self.flush_report()
+
+    # ------------------------------------------------------------------
+    # 舵机级入口（SET / S<n>= / JOY）—— 单位一律**舵机度**，与固件同一坐标系
+    # ------------------------------------------------------------------
+
+    def _handle_set(self, line: str) -> None:
+        """`SET <id> <ang> [<id> <ang>…]` / `S<id>=<ang>`：直接设定舵机目标角。
+
+        与固件 `arm_set_angle()` 一致：**钳位到该舵机的硬限位并返回生效值**，
+        越界不报错（真机就是在舵机允许的行程内截断）。
+        """
+        pairs, err = self.parse_set_pairs(line)
+        if err is not None:
+            self.out.line(f"ERR ARG {err}")
+            return
+        applied = {ch: self.set_servo_target(ch, ang) for ch, ang in pairs.items()}
+        self.mark_external()
+        self.out.line(self.encode_servo_kv("OK SET", applied))
+
+    def _handle_joy(self, line: str) -> None:
+        """`JOY <id> <raw>` / `JOY <r9> <r8> <r6> <r7>`：模拟硬件摇杆的一次拨动。"""
+        fields = line.split()
+        deltas: dict[int, int] = {}
+
+        if len(fields) == 3:                       # 单轴
+            try:
+                ch = int(fields[1])
+                raw = int(fields[2])
+            except ValueError:
+                self.out.line(f"ERR ARG JOY {' '.join(fields[1:])}")
+                return
+            if not self.has_servo(ch):
+                self.out.line(f"ERR ARG JOY {' '.join(fields[1:])}")
+                return
+            delta = joystick_delta(ch, raw)
+            if delta:
+                deltas[ch] = delta
+        elif len(fields) == 5:                     # 整帧（位次与固件 JOY 一致）
+            ids = (9, 8, 6, 7)
+            for i in range(4):
+                try:
+                    raw = int(fields[1 + i])
+                except ValueError:
+                    self.out.line(f"ERR ARG JOY {fields[1 + i]}")
+                    return
+                if not self.has_servo(ids[i]):
+                    continue
+                delta = joystick_delta(ids[i], raw)
+                if delta:
+                    deltas[ids[i]] = delta
+        else:
+            self.out.line("ERR SYNTAX JOY")
+            return
+
+        for ch, delta in deltas.items():
+            self.nudge_servo(ch, delta)
+        if deltas:
+            # ★ 摇杆驱动的运动 = **设备侧自主变化** ⇒ 位置变化要主动上报，
+            #   否则上位机界面停在旧值上（"摇杆动了但界面不动"）。
+            self.mark_external()
+        # 回执携带**实际**舵机角（对齐 sim.go / 固件 `OK JOY S9=.. S8=..`）
+        self.out.line(self.encode_servo_kv("OK JOY", self.current_servo()))
+
+    # ------------------------------------------------------------------
+    # 舵机空间小工具
+    # ------------------------------------------------------------------
+
+    def actuator_by_channel(self, ch: int):
+        """按**通道号**找执行器（返回 None 表示不存在）。
+
+        ⚠️ 通道号（6/7/8/9）**不等于**关节顺序里的位次 —— 别用 `self.order` 去索引它。
+        """
+        for a in self.robot.actuators:
+            if a.channel == ch:
+                return a
+        return None
+
+    def has_servo(self, ch: int) -> bool:
+        return self.actuator_by_channel(ch) is not None
+
+    def target_servo(self) -> dict[int, float]:
+        """当前**目标**舵机角（由 `sim.target_angles_deg()` 换算）。"""
+        targets = self.sim.target_angles_deg()
+        return self.joints_to_servo(targets)
+
+    def set_servo_target(self, ch: int, angle: float) -> float:
+        """直接设定某舵机的目标角（`SET` / `S<n>=` 语义）。返回**钳位后**生效值。
+
+        ⚠️ 只改 `target`，绝不改 `actual`（= 物理 `qpos`）。真机也是这个语义：
+           `arm_set_angle()` 只写目标，实际位置由舵机自己慢慢爬过去。
+        """
+        a = self.actuator_by_channel(ch)
+        if a is None:
+            return angle
+        if angle < a.servo_min:
+            angle = a.servo_min
+        if angle > a.servo_max:
+            angle = a.servo_max
+        self.sim.set_target_joints({a.joint_id: a.servo_to_joint(angle)})
+        return angle
+
+    def nudge_servo(self, ch: int, delta: int) -> None:
+        """在当前**目标角**上增量（`JOY` 语义），并钳位到舵机硬限位。
+
+        ⚠️ 基于 target 而不是 actual 增量，且不改写 actual —— 与固件
+           `arm_nudge()` 同一取向：斜坡中途的拨动只微调终点，不中断正在进行的运动。
+           （固件注释里记着：旧写法 `target = current` 会把正在斜坡中的目标就地取消，
+           表现正是"gripper 有概率不执行"。）
+        """
+        a = self.actuator_by_channel(ch)
+        if a is None or delta == 0:
+            return
+        v = self.target_servo().get(ch, 0.0) + float(delta)
+        if v < a.servo_min:
+            v = a.servo_min
+        if v > a.servo_max:
+            v = a.servo_max
+        self.sim.set_target_joints({a.joint_id: a.servo_to_joint(v)})
+
+    def parse_set_pairs(self, line: str) -> tuple[dict[int, float], str | None]:
+        """解析 `SET <id> <ang> [<id> <ang>…]` 与简写 `S<id>=<ang>`。
+
+        返回 `(pairs, None)` 或 `({}, 错误说明)`。
+        """
+        m = RE_SERVO_SHORTHAND.match(line)
+        if m is not None:
+            ch = int(m.group(1))
+            if not self.has_servo(ch):
+                return {}, f"未知舵机 S{ch}"
+            return {ch: float(m.group(2))}, None
+
+        fields = line.split()
+        if len(fields) < 3 or len(fields) % 2 != 1:
+            return {}, "SET 需要成对的 <id> <angle>"
+        if (len(fields) - 1) // 2 > MAX_SET_PAIRS:
+            # 与固件 MAX_PAIRS 对齐 —— sim 不该比真机宽容
+            return {}, f"SET 最多 {MAX_SET_PAIRS} 组"
+        out: dict[int, float] = {}
+        for i in range(1, len(fields) - 1, 2):
+            try:
+                ch = int(fields[i])
+            except ValueError:
+                return {}, f"未知舵机 {fields[i]!r}"
+            if not self.has_servo(ch):
+                return {}, f"未知舵机 {fields[i]!r}"
+            try:
+                out[ch] = float(fields[i + 1])
+            except ValueError:
+                return {}, f"角度 {fields[i + 1]!r} 不是数字"
+        return out, None
+
+    def mark_external(self) -> None:
+        """把后续的位置推进标记为"设备侧外部变化"（上报走 `# SERVO`）。"""
+        self.external_motion = True
+
+    def flush_report(self) -> None:
+        """补报被"命令在途"让位掉的外部变化（值**当场取**，因此是 latest-wins）。"""
+        if not self.report_dirty:
+            return
+        self.out.line(self.encode_servo_report(self.current_servo()))
+        self.report_dirty = False
 
     # ------------------------------------------------------------------
     # 主循环
@@ -261,8 +567,27 @@ class MujocoDevice:
         """
         q = np.array(self.sim.data.qpos, copy=True)
         if last_qpos is None or float(np.max(np.abs(q - last_qpos))) > 1e-5:
-            self.out.line(self.encode_state(self.current_joints()))
+            # ★ 两条上报路径在这里分流（见文件头）：
+            #     external_motion=True  → 设备侧自主变化 ⇒ `# SERVO`（origin=device）
+            #     external_motion=False → 命令引起       ⇒ `STATE`  （origin=command）
+            #   ⚠️ 不能反过来、也不能只留一条：用 `STATE` 跑外部变化会让界面把命令侧
+            #      拖向实际位置（拖滑杆时看到滑杆被回拉）；只发 `# SERVO` 则命令路径
+            #      失去状态回推，**误差面板恒为 0**，整条"滞后→收敛"语义被抹掉。
+            if self.external_motion:
+                # ★ 低优先级：命令在途时**让位** —— 只记脏、不发。
+                #   注意此刻**不更新快照**（返回 last_qpos），因此下一轮仍会看到
+                #   位移并再次尝试上报 ⇒ 让位 ≠ 丢弃。
+                if self.jr_busy:
+                    self.report_dirty = True
+                    return last_qpos
+                self.out.line(self.encode_servo_report(self.current_servo()))
+                self.report_dirty = False
+            else:
+                self.out.line(self.encode_state(self.current_joints()))
             return q
+        # 已静止：若还有被"命令在途"让位掉的外部变化，在此补报**最新值**
+        # （值不缓存 ⇒ 天然 latest-wins，不会积压中间帧）。
+        self.flush_report()
         return last_qpos
 
     def run(

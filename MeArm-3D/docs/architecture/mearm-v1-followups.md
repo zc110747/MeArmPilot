@@ -79,18 +79,28 @@
 
 ---
 
-## F5 · `device.mujoco.python` 是本机绝对路径
+## F5 · ~~`device.mujoco.python` 是本机绝对路径~~ ✅ **已修掉（2026-09-16，ADR D81）**
 
-**症状**：换一台机器后 `device.mode: mujoco` **必然起不来**（启动握手超时）。
+**原症状**：换一台机器后 `device.mode: mujoco` **必然起不来**（启动握手超时）。
 
-**根因**：`backend/config.yaml` 里写的是
-`C:/Users/lx176/.workbuddy/binaries/python/envs/default/Scripts/python.exe`。
-该值原先是**另一个用户目录**，已修正为当前机器，但机制上仍然脆弱。
+**原根因**：`backend/config.yaml` 里写的是
+`C:/Users/lx176/.workbuddy/binaries/python/envs/default/Scripts/python.exe` ——
+一个**已不存在的用户目录**（"换机器即失效"的标本；本文档写的"已修正为当前机器"
+只是把它换成了另一台机器的绝对路径，机制并未变）。
 
-**建议修法**（任一）：① 留空，回退到 PATH 上的 `python`；
-② 由 `start.bat` 探测本机解释器后注入；③ 改为相对路径 + 环境变量覆盖。
+**已落地的修法**（合并了原"建议修法 ①③"）：字段**留空**，改由
+`cfg.ResolveMujocoPython(configured)` 解析，优先级：
 
-**现在不修**：属运行环境配置，与基线冻结无关；且当前机器上工作正常。
+1. 显式配置值（非空时直接用）
+2. 环境变量 `ARMPILOT_MUJOCO_PYTHON`（临时切换 / CI 用，不必改被跟踪的文件）
+3. `<用户目录>/.workbuddy/binaries/python/envs/default/{Scripts/python.exe, bin/python}`
+   —— **相对用户目录**，换用户名照样成立
+4. PATH 上的 `python`
+
+`config.yaml` 与新增的 `config.mujoco.yaml` 两处都**留空**，并注明"**不要**在这里写本机绝对路径"。
+
+**验收**：`verify_device_follow.mjs --config mujoco` **22/22 PASS**（连跑 3 次稳定）·
+`go vet` 干净 · `go test ./...` 全绿。
 
 ---
 

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -66,8 +67,9 @@ type DeviceConfig struct {
 //    质量、惯量、摩擦、增益、关节限位一律来自 robot-package/mearm-v1/physics/physics.yaml 与
 //    robot-package/mearm-v1/model/robot.yaml —— 在这里再抄一份，就是第二份真值。
 type MujocoConfig struct {
-	// Python 解释器命令。留空 = PATH 里的 "python"。
-	// ⚠️ 必须指向装了 mujoco 包的解释器（本机是隔离环境里的那一个）。
+	// Python 解释器命令。留空 = 按 ResolveMujocoPython 的优先级解析
+	// （环境变量 → 用户目录下的隔离环境 → PATH 里的 "python"）。
+	// ⚠️ 必须指向装了 mujoco 包的解释器。**不要在这里写死本机绝对路径**。
 	Python string `yaml:"python"`
 	// Script server.py 路径；留空按 ResolveMujocoScript 的候选列表回退。
 	Script string `yaml:"script"`
@@ -281,6 +283,45 @@ func ResolveMujocoScript(configured string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("找不到 MuJoCo 服务脚本 server.py，已尝试:\n  %s", joinLines(tried))
+}
+
+// ResolveMujocoPython 解析 MuJoCo 子进程要用的 Python 解释器。
+//
+// 为什么不能把解释器路径写进 `config.yaml`：那是一个**只在本机成立**的绝对路径，
+// 换机器/换用户名即失效，而失效的表现是"设备可用但永远没有回执"（最贵的一类失败）。
+// 本项目对这类写法的既有态度见 ResolveMujocoScript 的注释（换机器即失效的写法一律禁止）。
+//
+// 优先级：
+//  1. **显式配置**（`device.mujoco.python`）—— 配了就照用，不做存在性校验，
+//     因为 `python` 这类裸命令本身就是合法的（由 exec.LookPath 解析）；
+//  2. 环境变量 `ARMPILOT_MUJOCO_PYTHON` —— 给 CI / 临时切换用，不必改被跟踪的文件；
+//  3. <用户目录>/.workbuddy/binaries/python/envs/default 下的隔离环境
+//     —— 这是本仓一直沿用的**相对**位置（`Scripts/python.exe` on Windows、
+//        `bin/python` 其它平台），换用户名照样成立；
+//  4. 兜底 `python`（PATH）。
+//
+// ⚠️ 装没装 `mujoco` 包由 `device.NewMujoco` 的启动握手负责暴露（它会给出
+//    指向正确解释器的修复指引），这里不重复做一遍探测 —— 那种"先猜一次"的写法
+//    会在解释器存在但缺包时给出误导性的错误信息。
+func ResolveMujocoPython(configured string) string {
+	if s := strings.TrimSpace(configured); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(os.Getenv("ARMPILOT_MUJOCO_PYTHON")); s != "" {
+		return s
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		for _, rel := range [][]string{
+			{".workbuddy", "binaries", "python", "envs", "default", "Scripts", "python.exe"},
+			{".workbuddy", "binaries", "python", "envs", "default", "bin", "python"},
+		} {
+			p := filepath.Join(append([]string{home}, rel...)...)
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				return p
+			}
+		}
+	}
+	return "python"
 }
 
 func joinLines(items []string) string {

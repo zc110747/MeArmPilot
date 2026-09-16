@@ -93,6 +93,66 @@ RESET                # 全部回 90°
 理由见 `bsp/uart.c` 文件头：应答被挤掉就等于"上位机认为机械臂没收到命令"，
 而那正是历史上最难查的一类故障。
 
+### 3.2 三条设备链路对等落地（`sim` / `mujoco` / `serial`）—— **已实现**
+
+`device.Device` 有三个实现，**同一条 `# SERVO` 契约、同一个 `origin` 语义**：
+
+| 链路 | 实现 | 上报编码 | 让位闸门 |
+|------|------|----------|----------|
+| `sim` | `backend/internal/device/sim.go`（内置假固件） | `# SERVO` / `STATE` | `jrBusy` + `flushReport()` |
+| `mujoco` | `backend/internal/device/mujoco.go` + `simulation/mujoco/server.py` | 同上（stdio 上跑同一套文本协议，逐字节一致） | `jr_busy` + `flush_report()` |
+| `serial` | `backend/internal/device/serial.go` → ATmega328P 固件 | 同上（固件 `arm_report_tick()`） | `uart_tx_used() == 0` |
+
+三处闸门的语义**完全一致：让位 ≠ 丢弃**。被在途命令挡下时只置脏标记，
+补报时**重新取值**（latest-wins）—— 既不积压，也不补发一个已经过时的旧姿态。
+
+同一个验收脚本跑三条链路（`--config` 决定用哪份运行配置）：
+
+```bash
+node core/tools/verify_device_follow.mjs --config sim      # 23/23（无需硬件）
+node core/tools/verify_device_follow.mjs --config mujoco   # 22/22（容差见下）
+node core/tools/verify_device_follow.mjs --config serial   # 23/23（需真机）
+```
+
+> ⚠️ **MuJoCo 的命令收敛容差比另外两条宽**（`MUJOCO_ACK_TOL = 1.0` vs 默认 `0.15`）。
+> 原因是**物理**而非实现差异：该链路有重力 + 有限 PD 增益，臂停在**力矩平衡处**而非命令角，
+> 实测 elbow 静态偏差 `0.551°`、shoulder `0.274°`（base / gripper `0.000°`），
+> 且 **3s 与 6s 读数完全一致** ⇒ 是**稳态误差**，不是"还没收敛"。见 ADR **D81**。
+
+**摇杆步长只有一份真值**：固件 `core/joystick.c::joystick_delta()`。
+Go `sim.go::joystickDelta` 与 Python `server.py::joystick_delta` 与它**逐值同式**
+（`raw` 钳位 `0..1023` → 死区 `200..800` 归零 → `step = 2 + beyond/30` 上限 `10`，
+正负号按通道号定）。
+⚠️ Python 侧 `beyond // 30` 与 C / Go 的向零取整**同值仅当 `beyond >= 0`**，
+该前提由 `raw` 先被钳位保证 —— 注释里钉住了这条，别照抄成通用式。
+单测表里含两条**真机实测交叉验证**过的用例（`(9,100)→+5`、`(7,0)→+8`）：
+只测自己写的表等于自证，必须有外部读数。
+`tests/sim/test_server.py` 另含 `joystick_delta(9, -100) == 8`、`(9, 99999) == (9, 1023)` 两条边界。
+
+#### ⚠️ 两处**刻意保留**的链路间不对称（不是遗漏 —— 改动前先读这一节）
+
+1. **`SET` 的 `origin` 随链路不同。**
+
+   | 链路 | `SET` 归属 | 原因 |
+   |------|-----------|------|
+   | `serial` | **命令路径**（固件 `s->external = false`，不主动上报） | 真机链路上 `SET` 只可能来自 `serial.go` 对 `JR` 的翻译 |
+   | `sim` / `mujoco` | **设备侧外部改动**（走 `# SERVO`，`origin=device`） | 这两条链路**直接处理 `JR`**、从不拆 `SET`（翻译只发生在 `serial.go`）⇒ 收到的 `SET` 只可能来自调试 / 验收脚本 |
+
+   同一串字节在两条链路上归属不同的 `origin`，**这是设计**：
+   判据是"**它由谁发出**"，不是"它长什么样"。
+   （`serial.go::handleLine` 的 `default` 分支确实会把调试期的裸 `SET` 透传给固件，
+   但回执**原样转发、不合成任何关节级回执** —— 与上表自洽。）
+
+2. **`STATUS` 的翻译层不同。**
+
+   | 链路 | 路径 |
+   |------|------|
+   | `sim` / `mujoco` | `protocol.ParseReply` 直接把 `STATUS S6=.. S7=..` 判为 `ReplyServo`（**实际角**） |
+   | `serial` | `serial.go::execStatus` 先 `awaitLineWithServo` 取值，再 `emitStateFromServo` **合成一行 `STATE`** |
+
+   ⇒ 上层（`controller.mergeState`）看到的结果相同，但**回执类型不同**。
+   在此处加断言必须**按链路写**，不能假定三条链路回执类型一致。
+
 ## 4. v1 目标：关节级协议（新增，向后兼容）
 
 ArmsPilot 的虚拟机械臂天然工作**关节空间**。v1 让固件也理解关节空间，
@@ -140,7 +200,7 @@ FB <j1> <j2> <j3> <grip>             # 实际关节角反馈，用于 Actual / E
 |----|-----|
 | 默认监听 | `0.0.0.0:8090`，端点 `/ws/joint`，健康检查 `/healthz` |
 | 为什么不是 8080 | `MeArm-RemoteControl` 已占用 8080（舵机级摇杆通道），两者**可同时运行** |
-| 链路末端 | `device.mode = sim`（内置假固件，Phase 8）\| `serial`（真串口，Phase 9） |
+| 链路末端 | `device.mode = sim`（内置假固件，Phase 8）\| `mujoco`（物理仿真，MuJoCo 轨）\| `serial`（真串口，Phase 9）—— **三者对等**，见 §3.2 |
 | 应用层心跳 | 客户端发 `ping` / 服务端回 `pong`；间隔 10s（前端）/ 15s（服务端传输层 ping） |
 | 传输层心跳 | 服务端发 RFC6455 `ping`，浏览器自动回 `pong`，40s 静默判死 |
 
@@ -206,7 +266,7 @@ WebSocket Client → Protocol(编解码) → Robot Controller → Device(sim | s
 | 编解码 | `internal/protocol` | JSON / `JR` / `OK JR` / `STATE` / `ERR` 的字符串↔结构体 | 不认识关节、不认识标定、不认识机械结构 |
 | 标定与限位 | `internal/robot` | 读 `config/robot.yaml`；关节↔舵机换算；限位校验 | 不认识 socket、不认识串口 |
 | 控制器 | `internal/controller` | **唯一"懂机械臂"处**：ACK 门控、latest-wins、标定回执核对、状态发布 | 不认识 HTTP / WebSocket 帧 |
-| 链路末端 | `internal/device` | `sim`（假固件）/ `serial`（Phase 9） | 不认识关节语义（只收发字节行） |
+| 链路末端 | `internal/device` | `sim`（假固件）/ `mujoco`（物理仿真）/ `serial`（Phase 9）—— 协议与固件逐字节一致，见 §3.2 | 不认识关节语义（只收发字节行） |
 | 对外 | `internal/wsserver` | RFC6455 帧、路由、广播、心跳 | 不认识关节语义（只转发） |
 
 ### 5.3 五条**必须做对**的语义（都有测试锁死）

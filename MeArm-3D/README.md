@@ -214,7 +214,9 @@ MeArm-3D/
 
 ```bat
 start.bat              :: SIM 模式（默认，不碰硬件）
+start.bat --mujoco     :: MUJOCO 模式（物理仿真，不碰硬件）
 start.bat --real       :: REAL 模式（config.serial.yaml，会真的动舵机）
+start.bat --sim        :: 强制 SIM 模式
 start.bat --help       :: 用法
 ```
 
@@ -228,6 +230,9 @@ start.bat --help       :: 用法
 |------|---------|----------|------|
 | `VITE_AUTO_CONNECT` | `ws` | `ws` | 页面挂载后自动连 WebSocket 后端（而非浏览器内 Mock） |
 | `VITE_AUTO_REAL` | 不设 | `1` | 连接成功后自动切到 Real Robot（带校验，见下） |
+
+> `--mujoco` 的注入与 SIM **完全相同**（`VITE_AUTO_CONNECT=ws`、不设 `VITE_AUTO_REAL`）——
+> MuJoCo 在安全门里属于「仿真」，`hello.simulation_mode = "mujoco"`，故不会切 Real Robot。
 
 > ⚠️ **REAL 模式下若后端链路末端不是 serial**（例如没插机械臂、串口号不对），
 > 自动切换会**被拒绝**（按钮保持 Simulation），日志给出拒绝原因与实际末端。
@@ -331,15 +336,29 @@ cd frontend && npm run dev
 ~/.workbuddy/binaries/python/envs/default/Scripts/python.exe -m pip install mujoco pyyaml pytest
 
 # 2) 起一个 MuJoCo 末端（python 子进程由 Go 侧拉起，stdio 上跑同一套文本协议）
-cd backend && ./bin/armpilot-backend.exe        # ★ 需先把 config.yaml 的 device.mode 改成 "mujoco"
+cd backend && ./bin/armpilot-backend.exe -c config.mujoco.yaml
 curl http://localhost:8090/healthz              # {"device":"mujoco","linked":true,"ok":true,...}
+#    一键等价：start.bat --mujoco
 
 # 3) 前端连上即可（Connection 面板 → ws://localhost:8090/ws/joint → Connect）
 #    前端零改动：mujoco 按"仿真"放行安全门，hello.simulation_mode = "mujoco"
 
 # 4) 独立 Viewer（不进 Web，直接看动力学）
 <python> simulation/mujoco/run.py --demo
+
+# 5) 「设备侧自主变化 → 上位机跟随」验收（三条链路同一个脚本）
+node core/tools/verify_device_follow.mjs --config mujoco
 ```
+
+> **三条链路对等**：`sim` / `mujoco` / `serial` 是 `device.Device` 的三个实现，跑同一套文本协议、
+> 同一个 `# SERVO` 上报契约、同一个 `origin` 语义，**controller / WebSocket / 前端零改动**。
+> 差别只在三份**运行配置**：`config.yaml`(sim) / `config.mujoco.yaml`(mujoco) / `config.serial.yaml`(serial)
+> —— 共用 8090 ⇒ **不能同时启动**（切换只需换 `-c` 的参数，或 `start.bat --sim|--mujoco|--real`）。
+> 详见 [`docs/serial-v1.md`](docs/serial-v1.md) §3.2（含两处**刻意保留**的链路间不对称）。
+>
+> ⚠️ MuJoCo 的命令收敛容差比另外两条宽（`MUJOCO_ACK_TOL = 1.0` vs `0.15`），原因是**物理**：
+> 有重力 + 有限 PD 增益 ⇒ 臂停在力矩平衡处，实测 elbow 静态偏差 `0.551°`、shoulder `0.274°`，
+> 且 3s 与 6s 读数一致（稳态误差，不是没收敛）。见 ADR **D81**。
 
 > ⚠️ **当前是 Level 3→4 参数化物理仿真**，`robot-package/mearm-v1/physics/physics.yaml` 的值全是公开值/估算值，
 > 不是对本台 meArm 的标定模型。详见 [`simulation/README.md`](simulation/README.md) §0。
@@ -360,7 +379,7 @@ curl http://localhost:8090/healthz              # {"device":"mujoco","linked":tr
 | 8 | **Go WebSocket** | ✅ | **后端独立 module `backend/`（8090）+ 内置「假固件」sim**：命令走 `JSON → JR 文本 → 舵机角 → 反算关节角 → STATE` 真实往返，非等值回显；`OK JR` **只做标定核对不发布状态**；ACK 门控 + latest-wins；`hello` 带模型真值在线互检；两层心跳；断线指数退避重连**并补发当前命令**。`go test` 56 项 · 前端新增 66 项单测（`wsProtocol` 25 / `WebSocketTransport` 30 / 接线验收 11）· e2e 新增 21 项真实 WS 端到端（见 `docs/coordinate-system.md` §3.4、`docs/serial-v1.md` §5、D27–D33） |
 | **9** | **Serial（真机）** | ✅ | `internal/device/serial.go` 落地真串口（Windows 非重叠 I/O，**不用 `bufio`**）；Uno DTR 复位静默窗口 `connect_settle_ms=2600` + 暖机包。**真机端到端闭环实测 PASS 18 / FAIL 1**：`hello=serial` · `homePose` 与 `robot.yaml` 逐位一致 · 7 步链路回推 `max\|Δ\| ≤ 0.004°` · 相机反解重复性肩 `0.26°`/肘 `0.01°`。见 `core/tools/verify_serial_e2e.mjs`、`docs/decisions.md` D34–D36 |
 | 10 | Real Robot | ✅ | 机构角色 / 标定 / 限位 / 零位**已实测就绪**（Phase 4.5 + `robot-package/mearm-v1/model/robot.yaml`）；Serial 已落地 ⇒ 浏览器拖动能**真实驱动物理机械臂**。**2026-09-12 修复 mode↔transport 联动缺口**：`Real Robot` 按钮原先只改 UI 样式、命令照样走当前 transport（"点了真机不动 / 切回仿真仍在动真机"），现补准入校验 + 安全门 + 去向提示（ADR **D41**）。⚠️ 相机验收已测出**肩标定增益偏差 −13.1%**（肘 +1.4% 已证实），需按锁死曝光重布台面后重测 |
-| **10.5** | **一键启动 `start.bat`** | ✅ | 根目录 `start.bat`：前置检查（backend exe / robot.yaml / node）、端口探测+确认清理（8090/5273）、按模式起前后端、打印本机+局域网地址。**关键**：注入 `VITE_AUTO_CONNECT=ws`（+ `--real` 时 `VITE_AUTO_REAL=1`）让页面**自动连后端并切 Real Robot** —— 原先页面默认停在 MockTransport 且不会自动连接，"脚本起好了但只动仿真臂"（ADR **D42**）。`npm run dev` 不注入，手动调试行为不变 |
+| **10.5** | **一键启动 `start.bat`** | ✅ | 根目录 `start.bat`：前置检查（backend exe / robot.yaml / node）、端口探测+确认清理（8090/5273）、按模式起前后端、打印本机+局域网地址。**关键**：注入 `VITE_AUTO_CONNECT=ws`（+ `--real` 时 `VITE_AUTO_REAL=1`）让页面**自动连后端并切 Real Robot** —— 原先页面默认停在 MockTransport 且不会自动连接，"脚本起好了但只动仿真臂"（ADR **D42**）。`npm run dev` 不注入，手动调试行为不变。★ 支持 `--sim` / `--mujoco` / `--real` 三模式（各对应一份 `config*.yaml`，见 ADR **D81**）|
 | **10.6** | **Real Robot 准入改为"拒绝"** | ✅ | 用户报障「前端显示 Real 模式但后端末端是 sim」。根因：`setMode('real')` 把 `set({ mode })` 写在准入校验**之前**，校验只 pushLog、状态照改（D41 只修了一半，且旧测试还把该行为固化成契约）。现改为**校验全通过才切换**，否则保持 Simulation 并说明原因；`device` 未知（hello 未到）也拒绝，`useAutoConnect` 相应改为等 device 到达再切（ADR **D43**） |
 | 11 | Real Feedback（**链路误差反馈面板**） | ✅ | 逐关节**带符号偏差条** + 误差**趋势 sparkline** + 一句**健康结论**（已到位 / 跟踪中 / 异常）。判据全在 `@robot/linkFeedback`（纯函数，19 项单测）。**关键**：`TransportStats.moving` 是 lag 的同义重写（`moving = lag > eps`），拿它判"是否在追"**永远推不出"卡死"** —— 判据只能从时间序列得出，且趋势用**四分位中位数**（首末值/均值会被单帧尖峰翻面）。纪律：没有正面证据不下"卡死"断言，`unknown`/`shrinking` 一律判 `tracking`（ADR **D44**） |
 | 12 | 虚拟 / 真实同步（**实际臂幽灵**） | ✅ | 场景同时渲染**两条臂**：主臂跟 `commandJoints`（意图）、半透明幽灵跟 `actualJoints`（现状），未被遮挡时露出的就是**滞后量** —— 比读数表更快。幽灵用**半透明**而非醒目色（本项目「无装饰色」，信号是位置分离本身）；`depthWrite=false` 防半透明脏面。e2e **取渲染后 `matrixWorld`** 而非重算 FK —— 挂错父节点/可见性误关/材质全透明都会让画面空掉而断言全绿（ADR **D45**） |
@@ -546,12 +565,17 @@ $PY core/tools/run_sim2sim.py --all               # 统一 Sim2Sim 矩阵（选�
 cd backend && go test ./...
 $PY core/tools/freeze_baseline.py                 # 真值冻结校验（不符退出码 1）
 $PY robot-package/mearm-v1/tools/gen_mearm_v1_baseline.py --check   # 黄金数据逐位复现
-node core/tools/verify_device_follow.mjs --config sim   # 设备侧自主变化→跟随（无需硬件）
+node core/tools/verify_device_follow.mjs --config sim      # 设备侧自主变化→跟随（无需硬件）
+node core/tools/verify_device_follow.mjs --config mujoco   # 同上（物理链路；容差 1.0°，理由见 D81）
+node core/tools/verify_device_follow.mjs --config serial   # 同上（需真机；**会真的动**）
 ```
 
-**最近一次全绿概要**（2026-09-16）：`tsc` 0 error · `vitest` 439 passed · `go test` 89 个顶层用例全绿 ·
-`pytest` 198 passed · 真值冻结 ✅ · 4 份黄金数据逐位一致 · `verify_device_follow.mjs` **23/23 PASS**
-（连跑 3 次稳定）· `run_sim2sim.py --all` 覆盖 mearm-v1 + so-arm101。
+**最近一次全绿概要**（2026-09-16）：`tsc` 0 error · `vitest` **439 passed**（142 文件）·
+`go vet` 干净 · `go test` **89 个顶层用例**全绿（5 包 · 0 FAIL）· `pytest` **214 passed**
+（core/tests 31 · tests/sim 167 · tests/sim2sim 9 · robot-package 7）· 真值冻结 ✅ ·
+4 份黄金数据逐位一致 · `verify_device_follow.mjs` sim **23/23** · mujoco **22/22** · serial **23/23**
+（真机；mujoco 连跑 3 次稳定）· 前端 DOM 读「状态 · Status」表 **9/9** ·
+`run_sim2sim.py --all` 覆盖 mearm-v1 + so-arm101。
 
 > **真机的证书型数字**（`go test` 计数 / 固件资源占用 / 相机残差）**一律现跑现取**：
 > 三份 README 各抄过一份计数，实测漂移成 147 / 161 / 318 / 425 四个版本。

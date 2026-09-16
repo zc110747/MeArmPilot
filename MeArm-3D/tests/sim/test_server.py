@@ -7,11 +7,22 @@
     这是**预期行为**（不是 bug），验收断言按此设容差；
   * `EncodeOKJR` 按**通道降序**输出 `S<n>=%.2f`；
   * `EncodeState` 按 `JointOrder` 位次、保留 2 位小数；
-  * `ParseReply` 只识别 `ERR` / `STATE` / `OK JR` 三种形状 —— 其余一律 `ReplyOther`。
+  * `EncodeServoReport` 输出 `# SERVO S9=… S8=… S7=… S6=…`（通道降序，2 位小数）。
 
-⚠️ 最后那条有个必须记住的推论：**`STATUS` 回执 Go 侧根本不解析**（落到
-`ReplyOther`）。也就是说 `STATUS` 只是人工调试用的旁路，真正的状态回推通道
-**只有 `STATE`**。写测试时把这点固化下来，免得日后有人拿 `STATUS` 当状态源。
+⚠️ 三条链路的**上报语义**（Go `ParseReply` 的分类）必须记准，别凭印象：
+
+  * `OK JR`                  → `ReplyOKJR`，携带**目标角**（核对标定用）
+  * `STATE <四个数值>`        → `ReplyState`，携带**实际关节角** ⇒ 命令引起
+  * `# … S<n>=…` / `STATUS …` → `ReplyServo`，携带**实际舵机角** ⇒ 设备侧自主变化
+  * `OK SET …` / `OK JOY …`   → `ReplyOther`（**刻意**不入白名单：它们含 `S<n>=`，
+                               但那是**钳位后的目标角**。收下就会"状态恒等于命令、误差恒为 0"）
+
+★ 这里有一条**曾经写反、现已修正**的登记项：本文件早期写着「`STATUS` 回执 Go 侧
+根本不解析（落到 `ReplyOther`）」。那是引入 `ReplyServo` 白名单之前的旧事实。
+现在的白名单是 `#` 与 `STATUS` 两个前缀 —— 因此 `STATUS` **会被**识别成
+`ReplyServo`（= 实际舵机角 ⇒ 界面跟随）。真机链路上这条不会生效，因为
+`serial.go` 的 `execStatus` 会先把它翻译成 `STATE`；那个**不对称**是已知的，
+登记在 `docs/serial-v1.md`。
 """
 from __future__ import annotations
 
@@ -19,6 +30,7 @@ import io
 import re
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -60,6 +72,11 @@ class Capture:
 
 @pytest.fixture
 def dev():
+    return make_dev()
+
+
+def make_dev() -> MujocoDevice:
+    """造一台设备 + 它的输出捕获器（需要"两台设备对照"的测试直接调用）。"""
     cap = Capture()
     d = MujocoDevice(out=cap.emitter)
     d.capture = cap            # type: ignore[attr-defined]
@@ -270,7 +287,9 @@ def test_state_uses_absolute_elbow_angle(dev):
 def classify_go_reply(line: str) -> str:
     """复刻 Go `ParseReply` 的分类（不认得的一律 OTHER）。
 
-    注意判定顺序：先 `ERR`，再 `STATE`，最后 `OK JR` —— 与 Go 一致。
+    ⚠️ 判定顺序与 Go **必须**一致：`ERR` → `STATE` → `ERR JOINT` → `OK JR`
+       → `#`/`STATUS` 舵机快照。顺序不是风格问题：含 `S<n>=` 的行有好几种，
+       把 `OK JR` 放到快照后面就会把"目标角"读成"实际角"。
     """
     up = line.upper()
     if up.startswith("ERR"):
@@ -283,7 +302,10 @@ def classify_go_reply(line: str) -> str:
         except ValueError:
             return "OTHER"
     if up.startswith("OK JR"):
-        return "OK_JR"
+        return "OK_JR" if re.search(r"S\d+=", line) else "OTHER"
+    # 白名单：`#`（异步上报）与 `STATUS`（查询应答）**才**算实际角
+    if re.search(r"S\d+=-?\d", line) and (line.startswith("#") or up.startswith("STATUS")):
+        return "SERVO"
     return "OTHER"
 
 
@@ -302,21 +324,36 @@ def test_go_parseable_replies_are_exactly_the_three_shapes(dev):
         assert classify_go_reply(first) == want, f"{cmd!r} → {first!r}"
 
 
-def test_status_ping_reset_are_reply_other(dev):
-    """★ 登记在案的"旁路"回执：`STATUS` / `OK PING` / `OK RESET` 都是 **ReplyOther**。
+def test_reply_classification_registry(dev):
+    """★ 登记在案的回执 → Go 分类映射（含两条最容易搞错的）。
 
-    Go 的 `ParseReply` 只认 `ERR` / `STATE` / `OK JR` 三种形状，其余一律
-    `ReplyOther`。也就是说：
-
-      * `STATUS` **不是**状态回推通道 —— 真正的状态通道只有 `STATE` 主动帧；
-      * `PING` 的应答 Go 也不解析（心跳只关心"有没有回音"）。
-
-    把这三条钉住，免得日后有人拿 `STATUS` 当状态源，或者误以为
-    `OK PING` 会被当作什么有意义的事件。
+      * `# SERVO …` → **SERVO**：实际角 ⇒ 上层发布 `origin=device` ⇒ 界面**跟随**
+      * `STATUS …`  → **SERVO**：同上（白名单第二个前缀）。真机链路上这条不会生效，
+                      `serial.go` 的 `execStatus` 会先把它翻译成 `STATE` ——
+                      那个**链路间不对称**是已知的，见 docs/serial-v1.md。
+      * `OK SET …` / `OK JOY …` → **OTHER**：它们**也**含 `S<n>=`，但携带的是
+                      **钳位后的目标角**。一旦收进白名单，状态就恒等于命令、
+                      误差恒为 0，整条"滞后 → 收敛"语义被一个乐观 ACK 抹掉。
+      * `OK PING` / `OK RESET` / `OK RESET -> 90` → **OTHER**（心跳只关心有没有回音）
     """
-    for cmd, first_line in (("STATUS", "STATUS S9=90 S7=90 S8=90 S6=90"),
-                            ("PING", "OK PING"),
-                            ("RESET", "OK RESET")):
+    cases = {
+        "# SERVO S9=90.00 S8=48.39 S7=117.58 S6=90.00": "SERVO",
+        "STATUS S9=90 S7=90 S8=90 S6=90": "SERVO",
+        # ⚠️ 光一个 `STATUS` 词、不带任何 `S<n>=` ⇒ 仍是 OTHER：白名单管的是**前缀**，
+        #    但 `reServoKV` 必须先匹配到键值对，两者是"与"的关系。
+        "STATUS": "OTHER",
+        "OK SET S9=90": "OTHER",
+        "OK JOY S9=98 S8=57 S7=26 S6=98": "OTHER",
+        "OK PING": "OTHER",
+        "OK RESET": "OTHER",
+    }
+    for line, want in cases.items():
+        assert classify_go_reply(line) == want, f"{line!r} 的分类变了？请复核 protocol.go"
+
+
+def test_ping_and_reset_are_reply_other(dev):
+    """`OK PING` / `OK RESET` 是旁路回执（Go 只关心"有没有回音"）。"""
+    for cmd, first_line in (("PING", "OK PING"), ("RESET", "OK RESET")):
         dev.capture.clear()
         dev.handle(cmd)
         assert dev.capture.lines()[0] == first_line
@@ -325,19 +362,276 @@ def test_status_ping_reset_are_reply_other(dev):
 
 
 # ---------------------------------------------------------------------------
+# ★ 核心语义（二）：设备侧自主变化（SET / JOY / S<n>=）→ `# SERVO`
+# ---------------------------------------------------------------------------
+#
+# 这一节钉住的是「下位机被命令之外的手段改了，上位机界面要跟着走」这条链路。
+# 真机上对应硬件摇杆 / 红外遥控 / 面板手拧；这里用固件级命令 SET / JOY 制造
+# 同样的**外部**变化，从而让三种链路（sim / serial / mujoco）用同一份验收脚本。
+#
+# ⚠️ 两条上报路径**不能混**：
+#     JR 受理       → `STATE`（命令引起，origin=command）
+#     SET/JOY       → `# SERVO`（设备自主变化，origin=device）
+#   反过来会立刻出两个真实缺陷：用 `STATE` 跑外部变化 ⇒ 拖滑杆时滑杆被"回拉"；
+#   外部变化走 `STATE` 之外的路 ⇒ 命令路径失去状态回推、误差面板恒为 0。
+
+#: 摇杆公式的期望值表。
+#:
+#: **期望值来源**：固件 `core/joystick.c::joystick_delta()` 的源码逐行推导
+#: （死区 200..800 不动 / `id==8` 方向取反 / 步长 2..10 与推杆深度成比例）。
+#: 其中两条**另有独立于源码的实测支撑**（这是它值得当锚点的原因）：
+#:
+#:   (9, 100) → +5   真机 `JOY 9 100` 让 base 关节 +5.000°；base 的 scale = 1 ⇒ 直读
+#:   (7, 0)   → +8   真机 `JOY 7 0` 让 shoulder 关节 +5.555°；shoulder 的
+#:                   scale = (100-20)/(49.455-(-6.094)) = 1.4401 ⇒ 8 / 1.4401 = 5.555 ✓
+#:
+#: 也就是说这张表不是"抄自己"，而是固件实测 ↔ 源码公式的**跨链路交叉验证**。
+JOYSTICK_CASES: tuple[tuple[int, int, int], ...] = (
+    (9, 500, 0),        # 死区内不动
+    (9, 200, 0),        # 边界：raw=200 不算 past_lo（严格小于）
+    (9, 199, 2),        # beyond=1 ⇒ 2 + 1//30 = 2
+    (9, 100, 5),        # beyond=100 ⇒ 2 + 3 = 5
+    (9, 0, 8),          # beyond=200 ⇒ 2 + 6 = 8
+    (9, 900, -5),       # past_hi：普通轴"推高"= 负
+    (9, 1023, -9),      # beyond=223 ⇒ 2 + 7 = 9，封顶 10 未触及
+    (8, 100, -5),       # id==8 方向取反
+    (8, 900, 5),
+    (6, 0, 8),
+    (7, 1023, -9),
+)
+
+
+def test_joystick_formula_matches_firmware():
+    """公式表的**逐值**锚定（固件 / Go / Python 三处必须同值）。"""
+    from server import joystick_delta
+
+    for servo_id, raw, want in JOYSTICK_CASES:
+        assert joystick_delta(servo_id, raw) == want, (
+            f"joystick_delta({servo_id}, {raw}) = {joystick_delta(servo_id, raw)}，期望 {want}")
+    # 越界输入必须先夹进 0..1023（固件第一件事就是夹）
+    assert joystick_delta(9, -100) == 8
+    assert joystick_delta(9, 99999) == -9
+    assert joystick_delta(9, 99999) == joystick_delta(9, 1023)
+
+
+def test_joy_moves_target_by_formula_step(dev):
+    """`JOY <id> <raw>` 在**目标**上增量，增量恰为公式步长（经舵机硬限位钳位）。"""
+    for servo_id, raw, want in JOYSTICK_CASES:
+        if want == 0:
+            continue
+        d = make_dev()
+        a = d.actuator_by_channel(servo_id)
+        before = d.target_servo()[servo_id]
+        d.handle(f"JOY {servo_id} {raw}")
+        after = d.target_servo()[servo_id]
+        expect = min(max(before + want, a.servo_min), a.servo_max)
+        assert after == pytest.approx(expect), (
+            f"JOY {servo_id} {raw}：目标 {before} → {after}，期望 {expect}")
+
+
+def test_joy_reply_carries_actual_servo_angles(dev):
+    """`OK JOY` 回执是**实际**舵机角（对齐固件 `OK JOY S6=.. S7=.. S8=.. S9=..`）。"""
+    dev.handle("JOY 7 0")
+    line = last_line(dev)
+    assert line.startswith("OK JOY "), line
+    chans = [p.split("=")[0] for p in line.split()[2:]]
+    assert chans == sorted(chans, reverse=True), f"通道未按降序：{chans}"
+    assert all(re.fullmatch(r"S[6-9]=\d+", p) for p in line.split()[2:]), line
+    # 此刻实际位置还停在 HOME（受理瞬间物理没动）
+    assert f"S7={int(round(dev.current_servo()[7]))}" in line
+
+
+def test_joy_full_frame_uses_firmware_channel_order(dev):
+    """`JOY <r9> <r8> <r6> <r7>` 的位次与固件一致（A0..A3 → 9/8/6/7）。"""
+    before = dev.target_servo()
+    dev.handle("JOY 0 1023 1023 0")
+    after = dev.target_servo()
+    # 期望增量写死（来自公式表），**钳位边界**从配置派生
+    for ch, want in ((9, 8), (8, 9), (6, -9), (7, 8)):
+        a = dev.actuator_by_channel(ch)
+        expect = min(max(before[ch] + want, a.servo_min), a.servo_max)
+        assert after[ch] == pytest.approx(expect), f"S{ch}: {before[ch]} → {after[ch]}，期望 {expect}"
+
+
+def test_joy_rejects_unknown_servo_and_bad_syntax(dev):
+    dev.handle("JOY 5 100")
+    assert last_line(dev).startswith("ERR ARG"), last_line(dev)
+    dev.capture.clear()
+    dev.handle("JOY 9")
+    assert last_line(dev) == "ERR SYNTAX JOY"
+
+
+def test_set_clamps_to_servo_hard_limit(dev):
+    """`SET` 越界**不报错**，钳到舵机硬限位并回生效值（复刻固件 `arm_set_angle`）。
+
+    ★ 同时证另一件事：`SET` **只改目标**，物理位置一步都没动
+      —— 这是"绝不 `qpos[...] = target`"（spec §12）的可观测判据。
+    """
+    a = dev.actuator_by_channel(9)
+    before_home = dev.current_servo()[9]
+    dev.handle(f"SET 9 {int(a.servo_max) + 50}")
+    line = last_line(dev)
+    assert line.startswith("OK SET"), line
+    assert f"S9={int(a.servo_max)}" in line
+    assert dev.target_servo()[9] == pytest.approx(a.servo_max)
+    assert dev.current_servo()[9] == pytest.approx(before_home)
+    assert abs(dev.current_servo()[9] - a.servo_max) > 5.0, "SET 直接把物理位置摆过去了？"
+
+
+def test_set_shorthand_is_equivalent_to_set_command():
+    """`S<id>=<ang>` 与 `SET <id> <ang>` 必须完全等价（含回执形状）。"""
+    d1, d2 = make_dev(), make_dev()
+    d1.handle("SET 6 88")
+    d2.handle("S6=88")
+    assert d1.capture.last() == d2.capture.last()
+    assert d1.target_servo()[6] == pytest.approx(d2.target_servo()[6])
+
+
+def test_set_accepts_up_to_three_pairs_like_firmware(dev):
+    """固件 `MAX_PAIRS=3`：sim 不该比真机宽容。"""
+    dev.handle("SET 9 90 8 90 7 90")
+    assert last_line(dev).startswith("OK SET"), last_line(dev)
+    dev.capture.clear()
+    dev.handle("SET 9 90 8 90 7 90 6 90")
+    assert last_line(dev).startswith("ERR ARG"), last_line(dev)
+
+
+def test_set_pairs_must_be_well_formed(dev):
+    dev.handle("SET 9")
+    assert last_line(dev).startswith("ERR ARG"), last_line(dev)
+    dev.capture.clear()
+    dev.handle("SET 9 abc")
+    assert last_line(dev).startswith("ERR ARG"), last_line(dev)
+    dev.capture.clear()
+    dev.handle("SET 5 90")
+    assert last_line(dev).startswith("ERR ARG"), last_line(dev)
+
+
+def test_external_change_reports_servo_not_state(dev):
+    """★ 外部变化 ⇒ `# SERVO`（不是 `STATE`）。
+
+    这一帧到后端就是 `origin=device`，前端据此让**命令侧**跟随；
+    若错发成 `STATE`，前端会把命令侧一路拖向实际位置（拖滑杆时滑杆被回拉）。
+    """
+    dev.handle("JOY 7 0")
+    dev.sim.step(20)
+    dev.capture.clear()
+    dev.report_if_moved(None)
+    line = last_line(dev)
+    assert line.startswith("# SERVO "), f"外部变化必须走 `# SERVO`，实得 {line!r}"
+    assert not line.startswith("STATE")
+    # 编码形状：通道降序 + 2 位小数（与 Go EncodeServoReport 逐字节一致）
+    chans = [p.split("=")[0] for p in line.split()[2:]]
+    assert chans == sorted(chans, reverse=True), f"通道未按降序：{chans}"
+    assert all(re.fullmatch(r"S[6-9]=\d+\.\d\d", p) for p in line.split()[2:]), line
+
+
+def test_command_change_still_reports_state(dev):
+    """★ 命令引起的运动**仍然**走 `STATE` —— 别把分流写成"一律 `# SERVO`"。
+
+    若写成一律 `# SERVO`，命令路径就失去状态回推，误差面板恒为 0，
+    整条"滞后 → 收敛"语义被抹掉（`controller` 里 `verifyCalibrationEcho` 同理）。
+    """
+    dev.handle("JR 0 20 130 50")
+    dev.sim.step(20)
+    dev.capture.clear()
+    dev.report_if_moved(None)
+    line = last_line(dev)
+    assert line.startswith("STATE "), f"命令引起的运动必须走 `STATE`，实得 {line!r}"
+    assert not line.startswith("#")
+
+
+def test_reset_clears_external_motion(dev):
+    """`RESET` 是**命令**路径 ⇒ 之后的位置推进回到 `STATE` 上报。"""
+    dev.handle("JOY 7 0")
+    dev.handle("RESET")
+    assert dev.external_motion is False
+    dev.sim.step(20)
+    dev.capture.clear()
+    dev.report_if_moved(None)
+    assert last_line(dev).startswith("STATE "), last_line(dev)
+
+
+def test_jr_clears_external_motion(dev):
+    """`JR` 同样是命令路径 ⇒ 之后回到 `STATE`（否则拖滑杆时滑杆会被回拉）。"""
+    dev.handle("JOY 7 0")
+    assert dev.external_motion is True
+    dev.handle("JR 0 20 130 50")
+    assert dev.external_motion is False
+
+
+def test_external_report_yields_to_command_in_flight(dev):
+    """★ 闸门：命令在途时外部上报**让位**（只记脏、不发），且**让位 ≠ 丢弃**。
+
+    ⚠️ 为什么要**直接构造在途态**：本链路走 stdio，命令处理是**同步**的，
+       `jr_busy` 窗口是亚毫秒级 —— e2e 脚本根本撞不进去。
+       这与 Go 侧同一条纪律：**闸门由单测证、e2e 只证可观测后果**
+       （playbook §14.10；那边 e2e 也摸不到 15ms 窗口）。
+    """
+    dev.handle("JOY 7 0")
+    dev.sim.step(20)
+    dev.capture.clear()
+
+    dev.jr_busy = True                       # 直接构造"命令在途"
+    snapshot = dev.report_if_moved(None)
+    assert dev.capture.lines() == [], "命令在途时不该发出任何上报"
+    assert dev.report_dirty is True, "让位必须留下脏标记（否则就是把上报丢了）"
+    assert snapshot is None, "让位时不该推进快照 —— 否则下一轮就看不到位移、真的丢了"
+
+    dev.jr_busy = False
+    dev.flush_report()                       # 命令了结 ⇒ 补报
+    line = last_line(dev)
+    assert line.startswith("# SERVO "), line
+    assert dev.report_dirty is False
+
+
+def test_flush_report_reports_latest_value_not_stale(dev):
+    """补报取的是**当时**的 actual ⇒ 中间帧被合并（latest-wins），不积压也不补旧姿态。"""
+    dev.handle("JOY 7 1023")                 # 肩向下拨满
+    dev.jr_busy = True
+    dev.sim.step(30)
+    dev.report_if_moved(None)                # 让位：只记脏
+    assert dev.report_dirty is True
+
+    dev.sim.step(300)                        # 让它多走一段
+    current = dev.current_servo()
+    dev.jr_busy = False
+    dev.capture.clear()
+    dev.flush_report()
+    line = last_line(dev)
+    assert line.startswith("# SERVO "), line
+    got = {int(p[1]): float(p.split("=")[1]) for p in line.split()[2:]}
+    for ch, v in got.items():
+        assert v == pytest.approx(current[ch], abs=0.01), (
+            f"S{ch} 补报的是旧值（{v} ≠ 当前 {current[ch]}）—— 违背 latest-wins")
+
+
+# ---------------------------------------------------------------------------
 # 真进程冒烟（Phase 7 的 Go 侧依赖的正是这条路径）
 # ---------------------------------------------------------------------------
 
 
 def test_server_process_smoke():
-    """像 Go 那样用管道起真进程：喂命令、读回执、靠 EOF 优雅退出。"""
+    """像 Go 那样用管道起真进程：喂命令、读回执、靠 EOF 优雅退出。
+
+    ⚠️ 命令必须**分两批**喂，中间留出主循环推进的时间 —— 这不是凑绿，而是
+       `pump_once()` 的既有语义决定的：它**先 drain 完队列再判 stop**，
+       所以「把所有命令（含 QUIT）一次喂完再关管道」会让循环在第一轮就退出，
+       **一步物理都不推**，于是根本不会产生任何上报帧。那样断言 `# SERVO`
+       失败的原因会是"测试没给主循环机会"，而不是"上报机制坏了"。
+    """
     proc = subprocess.Popen(
-        [sys.executable, str(SIM_DIR / "server.py"), "--no-realtime"],
+        [sys.executable, str(SIM_DIR / "server.py"), "--no-realtime", "--report-hz", "1000"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
     try:
-        out, err = proc.communicate("PING\nSTATUS\nJR 0 20 130 50\nQUIT\n", timeout=120)
+        proc.stdin.write("PING\nSTATUS\nJR 0 20 130 50\nSET 6 88\nS6=42\nJOY 7 0\n")
+        proc.stdin.flush()
+        time.sleep(1.0)          # 让主循环 drain → step → 上报
+        proc.stdin.write("QUIT\n")
+        proc.stdin.flush()
+        out, err = proc.communicate(timeout=180)
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -345,3 +639,11 @@ def test_server_process_smoke():
     assert "OK PING" in out, out
     assert "STATUS S9=90 S7=90 S8=90 S6=90" in out, out
     assert "OK JR S9=90.00 S8=48.39 S7=117.58 S6=90.00" in out, out
+    assert "OK SET S6=88" in out, out
+    assert "OK SET S6=42" in out, out
+    assert "OK JOY " in out, out
+    # ★ 端到端最关键的一条：真进程也必须产出 `# SERVO`（外部变化的上报通道）
+    assert "# SERVO " in out, f"外部变化没有产生 # SERVO 上报：\n{out}"
+    servo_line = next(ln for ln in out.splitlines() if ln.startswith("# SERVO "))
+    assert [p.split("=")[0] for p in servo_line.split()[2:]] == ["S9", "S8", "S7", "S6"], servo_line
+

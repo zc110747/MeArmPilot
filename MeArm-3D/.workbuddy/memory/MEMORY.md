@@ -1,7 +1,7 @@
 # MeArm-3D · 项目长期记忆（索引）
 
 > **本文件只是索引**：铁律 + 验收命令 + 去哪找细节。明细在 `playbook.md`（§1–§12），
-> 决策理由在 `docs/decisions.md`（D1–D80），每日过程在 `YYYY-MM-DD.md`。
+> 决策理由在 `docs/decisions.md`（D1–D81），每日过程在 `YYYY-MM-DD.md`。
 > ★ 注入阈值实测 ≈6.3k 字符，超出会被**静默截断**。**本文件必须 < 6.3k**，超了就往 playbook 搬。
 
 ## 一、铁律（读这一节就能不犯错）
@@ -46,14 +46,19 @@
   （**设备侧自主变化**）。界面是否跟随由后端 **`origin` 标注**决定，**前端禁止猜**；
   未知取值按 `command` 降级。自主上报**让位于命令应答**，且**让位 ≠ 丢弃**。
   → `playbook.md` §14.9 · 验收脚本 `core/tools/verify_device_follow.mjs`
+- ★★ **三条设备链路（sim / mujoco / serial）对等**，各有 `config*.yaml`，共用 8090 ⇒ 不能同起。
+  ⚠️ **同一串字节的 `origin` 可逐链路不同** —— 判据是"**由谁发出**"，不是"长什么样"
+  （`SET` 在真机 = 命令路径、在 sim/mujoco = 外部改动；`STATUS` 在 serial 被 `execStatus` 译成 `STATE`）。
+  MuJoCo 的重力静态偏差是**稳态**（elbow 0.55°，3s ≡ 6s）⇒ **按链路登记容差**（`MUJOCO_ACK_TOL=1.0`），
+  不是缺陷，更不许用"开机位自校准"去凑。→ ADR **D81** · `serial-v1.md` §3.2
 
 ## 二、验收
 
 **完整命令见 `playbook.md` §11**。实测基线（2026-09-16）：
-`pytest -q` **198**（core/tests 31 · tests 160 · robot-package 7）· `test_baseline_frozen` **11** ·
-`validate --all` ✓ · 前端 tsc 0 / vitest **439** · `go test` **89** 个顶层用例 ·
+`pytest -q` **214**（core/tests 31 · tests/sim 167 · tests/sim2sim 9 · robot-package 7）·
+`test_baseline_frozen` **11** · `validate --all` ✓ · 前端 tsc 0 / vitest **439** · `go test` **89** 个顶层用例 ·
 固件（AVR）FLASH **13104 B**（text 12966 + data 138）/ RAM **849 B**（.data 138 + .bss 711），零警告 ·
-`verify_device_follow.mjs --config sim` **23/23 PASS**（连跑 3 次稳定）。
+`verify_device_follow.mjs` sim **23/23** · mujoco **22/22** · serial **23/23**（连跑 3 次稳定）。
 
 - ★★ **证书型数字（测试计数 / 资源占用 / 残差）必须现跑现取，禁止照抄** ——
   改代码或改 README 之前**先跑一遍**。本轮实测撞到两例：旧文档写「tsc 0 error」实际报 2 条，
@@ -63,7 +68,7 @@
   贴限位下发同理。⇒ 目标要**夹进限位内**且离当前位置 ≥ 阈值；已在目标位就**跳过**而非判 FAIL。
   造前提的参数（如摇杆方向）要从**真值限位**里挑，**禁止写死常量** ——
   写死"向下拨"而向下只有 6.9° 行程，会被限位钳住并**误报成上报机制缺陷**。
-  → `playbook.md` §14.10（共 6 条）
+  → `playbook.md` §14.10（共 9 条）
 - ★★ **一条断言只证一件事**：干净基线 / 正向并发 / 反向抢占分开测，否则失败无法归因；
   且**别把"正确的语义"写成断言**（命令后设备又拨了 ⇒ 位置本就该是"目标+拨动"）。
   **闸门本身用单测证**（直接构造在途态），**脚本只证可观测后果** —— 别指望 e2e 摸到 15ms 窗口。
@@ -92,12 +97,12 @@
 | §9 `start.bat` + 真机验收两条证据链 · §11 验收七件套全文 | `playbook.md` §9 · §11 |
 | §10 CAD/STEP 接入（OCCT 铁律/平行四连杆实证） | `playbook.md` §10 · `docs/STEP_KINEMATICS_VALIDATION.md` |
 | §12 固件链路诊断（独立计数器 / 复位吞命令双窗口 / `STATS`） | `playbook.md` §12 |
-| §13 改真值的连锁清单 · §14 状态回传两条通路 + 验收脚本前提 · §15 skill 分层与拆分纪律 | `playbook.md` §13 · §14 · §15 |
+| §13 改真值的连锁清单 · §14 状态回传两条通路 + 三条链路对等 + 验收前提 · §15 skill 纪律 | `playbook.md` §13 · §14 · §15 |
 | 冻结/基线/黄金数据决策理由 | `docs/decisions.md` D55 / D71–D73 |
 | 多机器人统一验收 / 运行期切换 | ADR D77–D79 |
 | 首帧"重影" / 幽灵臂渲染（D74） | ADR **D74** · `core/tools/park_sim_pose.mjs` |
 | 末端目标「安全参数」（容差/内径/外径覆写 · 为何无限位调节 · 为何进 ik.ts） | **`docs/target-guard-analysis.md` §7** |
-| 未修的无关问题 F1–F9 | `docs/architecture/mearm-v1-followups.md` |
+| 无关问题 F1–F9（**F5 已于 2026-09-16 修掉**，见 D81） | `docs/architecture/mearm-v1-followups.md` |
 
 ## 四、skill 分层约定（`~/.workbuddy/skills/`）
 

@@ -5,9 +5,11 @@ rem ----------------------------------------------------------------------------
 rem  Starts the Go backend and the Vite frontend, each in its own console window.
 rem
 rem  Usage:
-rem      start.bat          SIM mode (default, does NOT touch hardware)
-rem      start.bat --real   REAL mode (config.serial.yaml, moves the physical arm)
-rem      start.bat --help   show this help
+rem      start.bat           SIM mode (default, does NOT touch hardware)
+rem      start.bat --mujoco  MUJOCO mode (physics simulation, no hardware)
+rem      start.bat --real    REAL mode (config.serial.yaml, moves the physical arm)
+rem      start.bat --sim     force SIM mode
+rem      start.bat --help    show this help
 rem
 rem  Design notes
 rem  ------------
@@ -58,8 +60,9 @@ if "%~1"=="" goto :parsed
 if /i "%~1"=="--help" goto :usage
 if /i "%~1"=="-h"     goto :usage
 if /i "%~1"=="/?"     goto :usage
-if /i "%~1"=="--real" (set "MODE=real" & set "CFG=config.serial.yaml" & shift & goto :parse)
-if /i "%~1"=="--sim"  (set "MODE=sim"  & set "CFG=config.yaml"        & shift & goto :parse)
+if /i "%~1"=="--real"   (set "MODE=real"   & set "CFG=config.serial.yaml" & shift & goto :parse)
+if /i "%~1"=="--mujoco" (set "MODE=mujoco" & set "CFG=config.mujoco.yaml" & shift & goto :parse)
+if /i "%~1"=="--sim"    (set "MODE=sim"    & set "CFG=config.yaml"        & shift & goto :parse)
 echo [FAIL] Unknown argument: %~1
 echo        Run "start.bat --help" for usage.
 goto :end
@@ -222,6 +225,15 @@ rem  command literally named "then". Passing /d and the program as separate
 rem  arguments to start avoids the whole problem.
 echo.
 echo [2/3] Launching services ...
+if /i "%MODE%"=="mujoco" (
+  echo.
+  echo  +------------------------------------------------------------------+
+  echo  ^|  MUJOCO MODE -- physics simulation, no hardware is touched.      ^|
+  echo  ^|  Config: config.mujoco.yaml                                      ^|
+  echo  ^|  Needs a python interpreter that has the mujoco package.         ^|
+  echo  ^|  Close each window, or press Ctrl+C, to stop it.                 ^|
+  echo  +------------------------------------------------------------------+
+)
 if /i "%MODE%"=="real" (
   echo.
   echo  +------------------------------------------------------------------+
@@ -309,10 +321,15 @@ if /i "%MODE%"=="real" (
   echo.
   echo   If that hint does NOT appear, the link is wrong and the arm will not
   echo   move -- check steps 1 and 2 above.
+) else if /i "%MODE%"=="mujoco" (
+  echo.
+  echo   MUJOCO mode: physics simulation, no hardware is touched.
+  echo   Link end is the MuJoCo physics server ^(a python subprocess^).
 ) else (
   echo.
   echo   SIM mode: no hardware is touched. Commands only move the virtual arm.
   echo   To drive the real arm, close these windows and rerun: start.bat --real
+  echo   For real physics instead of the kinematic fake:   start.bat --mujoco
 )
 echo.
 echo   Truth file: config\robots.yaml selector ^(not modified by this script^)
@@ -334,10 +351,11 @@ if not defined DEF_ROBOT set "DEF_ROBOT=?"
 echo.
 echo  ArmPilot MeArm-3D launcher
 echo.
-echo    start.bat          SIM mode ^(default; safe, no hardware^)
-echo    start.bat --real   REAL mode ^(config.serial.yaml; the arm moves^)
-echo    start.bat --sim    force SIM mode
-echo    start.bat --help   this message
+echo    start.bat           SIM mode ^(default; safe, no hardware^)
+echo    start.bat --mujoco  MUJOCO mode ^(physics simulation; no hardware^)
+echo    start.bat --real    REAL mode ^(config.serial.yaml; the arm moves^)
+echo    start.bat --sim     force SIM mode
+echo    start.bat --help    this message
 echo.
 echo  Ports: backend %WEB_PORT%, frontend %FE_PORT%
 echo  Serial port: read from backend\config.serial.yaml, edit it there

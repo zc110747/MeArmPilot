@@ -162,7 +162,18 @@
 - ★★ **本机 `sort` 解析到 Windows `System32\sort.exe`**（不认 `-u`）⇒ `... | sort -u` **静默返回空**，
   表现为"按 PID 清理进程"的循环一个都没杀。去重用 `awk '!seen[$0]++'`，或走 `/usr/bin/sort`。
   **与 §1 的 `grep \b`、`taskkill //PID` 是同一类坑：工具语义没验证。**
-- `backend/config.yaml → device.mujoco.python` 是**本机绝对路径**，换机器必改（followups **F5**）。
+- ★★ **`npx vitest run` 会被沙箱拦，且 stdout 被打成乱码**（2026-09-16 实测）：
+  `npx` 触发对 `wsl.exe` 的黑名单拦截，输出是 `襜輣繈顣0` 这类二进制噪声、`exit=1` ——
+  **看起来像"前端单测炸了"，其实一条都没跑**。
+  ⇒ 取计数一律**绕开 npx、落盘再读**：
+  `node node_modules/vitest/vitest.mjs run --reporter=json --outputFile=<path>`，
+  再读 JSON 的 `numPassedTests` / `numTotalTests`（`--reporter=default` 走 stdout 不可靠）。
+  ★ 同类：**要真跑 `.bat`**，Bash / PowerShell 工具都拦 `cmd.exe` ⇒ 用 **Python `subprocess`**，
+  且输出**重定向到文件**而非 `capture_output`（`start` 拉起的子进程继承管道句柄 ⇒ 永久挂起）。
+- ~~`backend/config.yaml → device.mujoco.python` 是**本机绝对路径**，换机器必改（followups F5）~~
+  **已于 2026-09-16 修掉**（ADR **D81**）：该字段改**留空** + `cfg.ResolveMujocoPython()` 解析 ——
+  显式配置 → `ARMPILOT_MUJOCO_PYTHON` → 用户目录下的隔离环境 → PATH 的 `python`。
+  原来写死的 `C:/Users/lx176/...` **那台机器已不存在**（"换机器即失效"的标本）。
 - ★★ **`git push` 在本沙箱"推送已生效，但退出非 0 / 或干脆不退出"**（2026-09-14 实测两次）：
   stderr 末尾是 `fatal: unable to write credential store: Permission denied` +
   `[sandbox] 命令被沙箱拦截 … C:\Users\lx176\.git-credentials (写 · 剥写)`，
@@ -914,6 +925,37 @@ RAM 844 → **849 B**，零警告。
 
 6. **同一个量只能有一套口径**（本项目老坑）：验收脚本里的"一次拨动走多远"必须
    **实测**（阶段 ② 量一次），**不能**用标定 `scale` 反算 —— 那就是"第二处重算真值"。
+
+7. **"进程已经跑起来了"比"二进制比源码旧"隐蔽得多 —— 启动器的陈旧闸门管不到在跑的进程。**
+   实测（2026-09-16 晚）：`backend/bin/armpilot-backend.exe` 是 **09-15 19:03** 构建，
+   09-16 17:15 的提交 `7cec472` 改了 Go 源码却**没有重建**。`start.bat` 的陈旧闸门
+   （任一 `.go` 比 exe 新 ⇒ 自动 `go build`）**只在启动时**跑，而那个进程早就起来了
+   ⇒ 页面收不到（也不认识）新报文，症状正是「**真机摇杆动了、页面不动**」。
+   ⇒ 判"是不是构建产物陈旧"**既不要看源码时间、也不要看进程启动时间**，直接探**二进制符号**：
+   字节搜索 `device_command` / `ORIGIN_DEVICE` / `ReplyServo` **0 命中**即确诊
+   （实测这三个串在旧 exe 里全为 0，新 exe 里全有）。
+   与 §12「工具自己误报」同族：**症状在链路，根因在构建**。
+
+8. **物理链路的稳态偏差 ≠ 移植缺陷。判据是"它在不在动"，不是"它差多少"。**
+   MuJoCo 有重力 + 有限 PD 增益 ⇒ 臂停在**力矩平衡处**而非命令角。
+   实测 elbow `0.551°` / shoulder `0.274°`，base / gripper `0.000°`。
+   **三条读数**才能把它定为物理而非实现：
+   ① 不发任何命令、空载静置，elbow 一样差 `0.59°`；
+   ② **3s 与 6s 读数完全一致**（稳态误差，不是"还没收敛"）；
+   ③ 偏差只出现在**受重力**的关节上（base 转轴竖直、gripper 轻 ⇒ 0）。
+   ⇒ 正确处置是**按链路登记容差**（`MUJOCO_ACK_TOL = 1.0`），
+   不是放宽全局阈值，更不是改物理模型去凑判据。
+   ★ 附带复盘：**别用"开机静态偏差"做自校准**。开机快照取在 `t≈0.5s`，臂还在从初始
+   `qpos` 往平衡态松弛 ⇒ 两次测量给出 `0.201°` 与 `0.59°`，**不可复现**。
+   拿它当真值 = 把噪声焊进判据。（第一版就这么写的，自己推翻。）
+
+9. **"同一串字节"在不同链路上可以有不同的 `origin` —— 判据是"它由谁发出"。**
+   `SET` 在真机链路上只可能来自 `serial.go` 对 `JR` 的翻译 ⇒ 固件当**命令**路径（不上报）；
+   而 `sim` / `mujoco` **直接处理 `JR`**、从不拆 `SET` ⇒ 它们收到的 `SET` 必来自调试/验收脚本
+   ⇒ 按**外部改动**对待（走 `# SERVO`）。
+   ⇒ 加跨链路断言时**必须按链路写**，不能假定三条链路"同输入 ⇒ 同 `origin`、同回执类型"
+   （`STATUS` 在 serial 被 `execStatus` 翻译成一行 `STATE`，在 sim/mujoco 直接被判 `ReplyServo`）。
+   这类不对称**要在文档里登记成"设计"**，否则下一个人会把它当 bug 去"修"。
 
 ## §15 skill 分层与拆分纪律（自 MEMORY.md §四 搬入，2026-09-16）
 

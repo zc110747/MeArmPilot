@@ -72,6 +72,7 @@ func run(cfgPath, robotIDFlag string) error {
 	// ---- 链路末端 ----------------------------------------------------------
 	var dev device.Device
 	var mujocoScript string
+	var mujocoPython string
 	switch c.Device.Mode {
 	case "sim":
 		dev, err = device.NewSim(model, device.SimTuning{
@@ -102,8 +103,12 @@ func run(cfgPath, robotIDFlag string) error {
 			return rerr
 		}
 		mujocoScript = script
+		// 解释器同理：**不写死本机绝对路径**（换机器即失效）。解析顺序见
+		// cfg.ResolveMujocoPython：显式配置 → ARMPILOT_MUJOCO_PYTHON → 用户目录下的
+		// 隔离环境 → PATH 里的 python。
+		mujocoPython = cfg.ResolveMujocoPython(c.Device.Mujoco.Python)
 		dev, err = device.NewMujoco(model, device.MujocoConfig{
-			Python:         c.Device.Mujoco.Python,
+			Python:         mujocoPython,
 			Script:         mujocoScript,
 			ReportHz:       c.Device.Mujoco.ReportHz,
 			PhysHz:         c.Device.Mujoco.PhysHz,
@@ -124,8 +129,8 @@ func run(cfgPath, robotIDFlag string) error {
 		log.Printf("链路末端: %s (舵机 %.0f°/s · 延迟 %dms · tick %dms · 限位校验 %v)",
 			dev.Kind(), c.Device.Sim.MaxServoSpeed, c.Device.Sim.LatencyMs, c.Device.Sim.TickMs, c.Device.Sim.EnforceLimits)
 	case "mujoco":
-		log.Printf("链路末端: %s (脚本 %s · 物理 %.0fHz · 上报 %.0fHz · 实时 %v)",
-			dev.Kind(), mujocoScript,
+		log.Printf("链路末端: %s (脚本 %s · 解释器 %s · 物理 %.0fHz · 上报 %.0fHz · 实时 %v)",
+			dev.Kind(), mujocoScript, mujocoPython,
 			floatOr(c.Device.Mujoco.PhysHz, 1000), floatOr(c.Device.Mujoco.ReportHz, 30),
 			!c.Device.Mujoco.NoRealtime)
 		// ⚠️ 这两条告警的**适用对象不同**，必须分开说。

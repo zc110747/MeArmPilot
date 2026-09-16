@@ -38,23 +38,28 @@
  * --------------------------------
  *   自主上报的**触发优先级低于正常通讯的交互指令**：被挡下时**让位，但不丢弃**
  *   （保留脏标志，等命令了结后用**当时**的值补报 ⇒ 天然 latest-wins）。
- *   固件侧落点：`arm_report_tick()` 排在 `cmd_poll()` 之后，且只在 `uart_tx_used()==0`
- *   （TX 环全空）时才发。sim 侧落点：`jrBusy` 在途标志抑制 + 命令了结后 `flushReport()`。
- *   ⚠️ 闸门本身由 Go 单测证明，本脚本证明的是**端到端可观测后果** ——
+ *   三条链路的落点各自实现、规则完全一致：
+ *     固件 `arm_report_tick()`   排在 `cmd_poll()` 之后，且只在 `uart_tx_used()==0` 时才发
+ *     Go sim `jrBusy` 在途标志抑制 + 命令了结后 `flushReport()`
+ *     MuJoCo server.py `jr_busy` 抑制 + `flush_report()`（同上；该链路处理是同步的，
+ *       窗口亚毫秒 ⇒ 闸门由 Python 单测**直接构造在途态**证明）
+ *   ⚠️ 闸门本身由单测证明，本脚本证明的是**端到端可观测后果** ——
  *      为什么不能指望脚本走到闸门，见 `phase4()` 的注释（窗口太窄）。
  *
- * 本脚本的最大价值：**仿真与真机跑的是同一份脚本**
- * ------------------------------------------------
- *   中午（硬件不在手边）： `node core/tools/verify_device_follow.mjs --config sim`
- *   晚上（插上机械臂）：   `node core/tools/verify_device_follow.mjs --config serial`
+ * 本脚本的最大价值：**三条链路跑的是同一份脚本**
+ * --------------------------------------------------
+ *   `--config sim`    内置假固件（运动学 + 速率限制，无重力、无接触）
+ *   `--config mujoco` MuJoCo 刚体动力学（有重力、有接触，会**压不到位**）
+ *   `--config serial` 真机串口（会驱动物理舵机！）
  *   差别只在 `--config`。判定项、容差、时序完全一致 —— 这样"仿真通过了"才对夜间
- *   真机跑有参考价值。`device_command` 直通的是**原始设备指令**，在 sim 与真机上
- *   走的是同一条 `WriteLine` 出口，不存在"仿真走了捷径"。
+ *   真机跑有参考价值。`device_command` 直通的是**原始设备指令**，三条链路上走的是
+ *   同一条 `WriteLine` 出口，不存在"仿真走了捷径"。
  *
  * 用法
  * ----
  *   node core/tools/verify_device_follow.mjs                  # 复用 8090 上的实例
  *   node core/tools/verify_device_follow.mjs --config sim     # 起一个仿真后端
+ *   node core/tools/verify_device_follow.mjs --config mujoco  # 起一个 MuJoCo 后端（sim2sim）
  *   node core/tools/verify_device_follow.mjs --config serial  # 起一个真机后端（会驱动舵机！）
  *   node core/tools/verify_device_follow.mjs --dry-run        # 只打印计划
  *   node core/tools/verify_device_follow.mjs --only 3,4       # 只跑指定阶段
@@ -62,6 +67,7 @@
  * 前置
  * ----
  *   * `backend/bin/armpilot-backend.exe` 已构建（`cd backend && go build -o bin/armpilot-backend.exe .`）
+ *   * `--config mujoco` 时：需要一个装了 `mujoco` 包的解释器（见 backend/config.mujoco.yaml）
  *   * `--config serial` 时：机械臂接在 backend/config.serial.yaml 写的串口上
  *   * Node 18+（用内置全局 `WebSocket`，无第三方依赖）
  *
@@ -97,6 +103,49 @@ function opt(name, fallback) {
 }
 const flag = (name) => argv.includes(`--${name}`);
 
+/**
+ * `--config <名>` → 后端配置文件。
+ *
+ * ★ 三条链路**共用**这张表：名字与 `device.mode` 一一对应，配置文件只是
+ *   "把 mode 固定下来"的那一份运行参数。加链路时改这里一处，别在两处分叉判断
+ *   （`startBackend` 里原先就是两处并列的三元表达式，加第三个选项时必然漏一处）。
+ */
+const CONFIG_FOR = {
+  sim: 'config.yaml',
+  mujoco: 'config.mujoco.yaml',
+  serial: 'config.serial.yaml',
+};
+
+/** `--config <名>` → 期望的 `device.mode`（用于"复用已有实例"时的前提校验）。 */
+const DEVICE_FOR = {
+  sim: 'sim',
+  mujoco: 'mujoco',
+  serial: 'serial',
+};
+
+/**
+ * MuJoCo 链路的命令收敛容差（°）。
+ *
+ * ★ 为什么它必须比 sim/serial 宽：那两条链路的"实际位置"是**数值**量 —— 固件只吃
+ *   整数舵机度（量化 0.347°/肩）、运动学 sim 亦然，所以 0.4° 就是全部误差。
+ *   而 MuJoCo 末端是**物理**：有重力、PD 增益有限，臂停在"力矩平衡"处，
+ *   与命令角之间有一个**真实的静态偏差**（Level 3 的既定事实，不是缺陷）。
+ *
+ * 实测（2026-09-16，本机 mujoco 3.13 + mearm-v1 的 physics.yaml）：
+ *   elbow   Δ=0.551°   shoulder Δ=0.274°   base Δ=0.000°   gripper Δ=0.000°
+ *   而且 3s 与 6s 两次读数**完全一致** ⇒ 是稳态误差，不是"还没收敛"。
+ *   空载（不发任何命令）时 elbow 也差 0.59° ⇒ 纯重力，与命令路径无关。
+ *
+ * 取 1.0 = 0.347（量化）+ 0.55（最大静态偏差）+ 余量。这个量级仍然能抓住
+ * 任何**真回归**（状态回推错位/标定写反都是几度起步），同时又不会把物理误报成缺陷。
+ *
+ * ⚠️ 曾经试过"用空载开机位自校准"（tolerance = 开机偏差 + 余量），**已废弃**：
+ *   开机快照取在 t≈0.5s，臂还在从初始 qpos 松弛，两次运行分别量到 0.201° 和
+ *   0.59° —— **不可复现**。验收脚本的判据必须可复现，不能依赖"什么时候读的"。
+ *   physics.yaml 的增益若有改动，请重跑上面的探针并把新数字写进这条注释。
+ */
+const MUJOCO_ACK_TOL = 1.0;
+
 const A = {
   http: opt('http', process.env.BACKEND_HTTP ?? 'http://127.0.0.1:8090'),
   ws: opt('ws', process.env.BACKEND_WS ?? 'ws://127.0.0.1:8090/ws/joint'),
@@ -106,9 +155,17 @@ const A = {
   // 跟随幅度下限：一次 JOY 的步长是**舵机度**，经标定换算到关节度。取 0.5° 是为了
   // 只证明"确实动了"，不去假定 scale —— 假定 scale 就等于在验收脚本里重算真值。
   followTol: Number(opt('follow-tol', 0.5)),
-  // 命令收敛容差：固件只吃**整数舵机度**，量化上限 0.347°(肩) / 0.209°(肘)。
-  // 取 0.4 是"量化误差 + 一点余量"，再大就变成对真实偏差不敏感了。
+  // 命令收敛容差：链路末端的**量化**上限 —— 固件只吃整数舵机度，四舍五入误差
+  // 最大 0.347°(肩) / 0.209°(肘)。取 0.4 = 量化 + 一点余量。
+  //
+  // ★ 但**物理仿真链路另有真实的静态偏差**（见 phase1 的自校准）：MuJoCo 有重力、
+  //   PD 增益有限，臂停在"力矩平衡"处而不是命令角上。实测（2026-09-16）：
+  //   elbow 0.551° / shoulder 0.274°，且 3s 与 6s 读数**完全一致**（是稳态误差，
+  //   不是"还没收敛"）；空载开机位也差 0.59°。
+  //   ⇒ 拿 0.4 去判，会把**物理**误报成**链路缺陷**（§14.10 那一类假 FAIL）。
   ackTol: Number(opt('ack-tol', 0.4)),
+  /** 容差是怎么来的（写进断言文案，免得日后有人以为它只是随手拍的数）。 */
+  ackTolNote: '量化上限 0.347°',
   settle: Number(opt('settle', 700)),
   /** 阶段 ④：命令受理后多久插入摇杆（默认 60ms = 已受理、仍在斜坡上）。 */
   inflightMs: Number(opt('inflight-ms', 60)),
@@ -182,7 +239,7 @@ async function startBackend() {
   if (existing) {
     info(`复用 ${A.http} 上的实例（device=${existing.device}）`);
     if (A.config) {
-      const want = A.config === 'sim' ? 'sim' : A.config === 'serial' ? 'serial' : null;
+      const want = DEVICE_FOR[A.config] ?? null;
       if (want && existing.device !== want) {
         throw new Error(
           `${A.http} 上的实例是 device=${existing.device}，但 --config ${A.config} 要求 ${want}。` +
@@ -195,13 +252,13 @@ async function startBackend() {
   if (!A.config) {
     throw new Error(
       `${A.http} 上没有实例，且未指定 --config。` +
-        `用 --config sim 起一个仿真后端，或 --config serial 起一个真机后端。`,
+        `用 --config sim / mujoco / serial 起一个后端。`,
     );
   }
   if (!existsSync(BACKEND_EXE)) {
     throw new Error(`未找到 ${BACKEND_EXE}；先在 backend/ 下 go build -o bin/armpilot-backend.exe .`);
   }
-  const cfg = A.config === 'sim' ? 'config.yaml' : A.config === 'serial' ? 'config.serial.yaml' : A.config;
+  const cfg = CONFIG_FOR[A.config] ?? A.config;
   const child = spawn(BACKEND_EXE, ['-c', cfg], { cwd: BACKEND_DIR, stdio: 'ignore' });
   backendChild = child;
   child.on('exit', (code) => info(`后端进程退出 code=${code}`));
@@ -419,6 +476,15 @@ async function phase1(link) {
       // 把预期内的差异记成 FAIL 会训练出"忽略 FAIL"的习惯。
       info(`开机位置与 homePose 的差 max|Δ|=${f3(d)}°（真机模式下不判 FAIL，见脚本注释）`);
     }
+
+    // ★ 物理仿真链路要单独给容差 —— 它的"实际位置"来自物理，带着真实的静态偏差。
+    // 判据：**空载**开机位与 homePose 的差就是这条链路自身的静态误差（无命令在途、
+    // 无摇杆输入），把它打出来当**诊断**（不参与判据，理由见 MUJOCO_ACK_TOL 注释）。
+    if (link.hello.device === 'mujoco' && !argv.includes('--ack-tol')) {
+      A.ackTol = MUJOCO_ACK_TOL;
+      A.ackTolNote = `量化上限 0.347° + 物理静态偏差（重力，实测 elbow 0.55°/shoulder 0.27°）`;
+      info(`命令收敛容差 = ≤${A.ackTol}° —— ${A.ackTolNote}`);
+    }
   }
   info(`HOME = ${JSON.stringify(home)}`);
 
@@ -580,7 +646,7 @@ async function phase4(link) {
   const t = Date.now();
   link.send({ type: 'joint_command', joints: target });
   const best = await waitConverge(link, target, t);
-  check(`干净命令收敛（≤${A.ackTol}°，量化上限 0.347°）`, best <= A.ackTol,
+  check(`干净命令收敛（≤${A.ackTol}°，${A.ackTolNote}）`, best <= A.ackTol,
     `目标肩 ${f3(target.shoulder)}°，max|Δ|=${f3(best)}°${Number.isNaN(best) ? '（无状态帧 ⇒ 命令未受理，或目标与当前位置相同）' : ''}`);
   check('干净命令的状态帧 origin=command', link.commandSince(t).length > 0,
     `${link.commandSince(t).length} 帧`);
@@ -750,7 +816,7 @@ async function main() {
   console.log(`# 工程根目录   ${ROOT}`);
   console.log(`# 输出目录     ${A.outDir}`);
   console.log(`# 配置         ${A.config ?? '(复用已有实例)'}`);
-  console.log(`# 跟随容差     >${A.followTol}°   ·  命令收敛 ≤${A.ackTol}°`);
+  console.log(`# 跟随容差     >${A.followTol}°   ·  命令收敛 ≤${A.ackTol}°（基线；物理仿真链路按 Level 3 静态偏差放宽，见 ① 段）`);
 
   if (A.dryRun) {
     console.log('\n# 计划（--dry-run，未连接任何东西）');

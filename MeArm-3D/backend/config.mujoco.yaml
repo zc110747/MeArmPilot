@@ -1,0 +1,58 @@
+# =============================================================================
+# ArmPilot 后端 · MuJoCo 物理仿真运行配置（sim2sim 链路）
+# -----------------------------------------------------------------------------
+# 用途：链路末端换成 **MuJoCo 刚体动力学**（`device.Device` 的第三个实现），
+#      协议与真机固件逐字节一致 ⇒ controller / WebSocket / 前端一行都不用改。
+#
+# 启动：cd MeArm-3D/backend && ./bin/armpilot-backend.exe -c config.mujoco.yaml
+#      或：MeArm-3D\start.bat --mujoco
+#
+# 为什么要有这个文件（而不是直接改 config.yaml 的 device.mode）
+# ---------------------------------------------------------------------------
+#   ① `config.yaml` 的默认必须是 **sim**：那是唯一不碰硬件、不依赖额外运行时的
+#      模式，任何"默认跑不起来"的配置都会让人以为工程坏了。
+#   ② 三条链路要能**切换**着跑同一份验收脚本，就必然要有三份 mode 不同的配置。
+#      `config.serial.yaml` 是本文件的前例，命名与它对齐。
+#   ③ ⚠️ 三者共用 8090 端口，因此**不能同时启动** —— 想同时跑就改 `web.port`
+#      （8080 被 MeArm-RemoteControl 占着，刻意错开是既定约定）。
+#
+# ⚠️ 与 config.yaml 一样，本文件**只放运行参数**。关节限位、标定（offset/scale/
+#    reverse）、HOME 位一律来自 robot-package/mearm-v1/model/robot.yaml。
+# =============================================================================
+
+web:
+  host: "0.0.0.0"
+  port: 8090
+  path: "/ws/joint"
+  ping_interval_ms: 15000
+  client_timeout_ms: 40000
+
+robot:
+  # 模型**选择器**。三端（Go / Python / 前端）共用同一份声明 ——
+  # 各按自己的 default 猜，就会出现"限位在 Go 侧用 A 的、在 Python 侧用 B 的"。
+  selector_path: "../config/robots.yaml"
+  model_id: ""
+
+device:
+  mode: "mujoco"
+  mujoco:
+    # ⚠️ 留空 = 按 cfg.ResolveMujocoPython 解析（环境变量 → 用户目录下的隔离环境
+    #    → PATH 里的 python）。**不要**在这里写死本机绝对路径（换机器即失效）。
+    #    必须指向装了 mujoco 包的解释器，否则启动握手会失败并给出修复指引。
+    python: ""
+    script: ""             # 留空 = 按 ../simulation/mujoco/server.py → simulation/... 回退
+    report_hz: 30
+    phys_hz: 1000          # 物理步频率（Hz）—— 渲染帧率不决定它
+    batch_ms: 10           # 每次实时对齐前连续推进 10ms
+    no_realtime: false     # true = 不做实时对齐（离线回归 / 压测）
+    start_timeout_ms: 20000  # 启动握手超时（首次 import mujoco 较慢）
+
+control:
+  ack_timeout_ms: 2000
+  min_send_interval_ms: 0
+  # 标定回执核对容差（舵机角）。这里比的是 `OK JR` 回声与本地按标定算出的值，
+  # 而那条回声是 server.py 由**请求的关节角**换算出来的（不是 qpos）⇒ 只有 0.01°
+  # 的文本量化 ⇒ 与 kinematic sim 同一档，取 0.1 即可。
+  # ⚠️ 别因为"MuJoCo 有重力"就放宽这里：重力影响的是 **Actual**（qpos 反解），
+  #    它走的是 `STATE` / `# SERVO`，与 `OK JR` 的标定核对是两回事。
+  calib_tolerance_deg: 0.1

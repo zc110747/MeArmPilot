@@ -3,7 +3,69 @@
 记录"为什么这么做"，尤其是**与原 spec 示例不一致**的地方，方便后续复盘与修改。
 每条都有编号，代码注释会引用编号（如 `D2`）。
 
-> 本文**最新条目在前**（D80 在最上，D1 在最下）。
+> 本文**最新条目在前**（D81 在最上，D1 在最下）。
+
+## D81 · 三条设备链路对等：`# SERVO` / `origin` 在 sim·mujoco·serial 上同构，并登记两处刻意不对称
+
+**背景**：真机接入后用户报「真机摇杆动作后机械臂会动，但**前端页面不同步状态**」。
+
+**根因不是代码缺陷，是构建产物陈旧。** `backend/bin/armpilot-backend.exe` 是
+`2026-09-15 19:03` 构建的，而 09-16 17:15 的提交 `7cec472` 改了 Go 源码却**没有重建**。
+二进制符号级证据（`strings` 探测）：`device_command` **0** 次、`ORIGIN_DEVICE` **0** 次、
+`ReplyServo` **0** 次；WS 探针收到 `{"code":"BAD_MESSAGE","message":"未知消息类型: device_command"}`，
+且 `joint_state` 无 `origin` 字段。重建后真机链路立即 23/23 + 前端 DOM 9/9。
+
+> ⚠️ 这条值得单独记住：`start.bat` 只在**启动时**检查"源码比二进制新"，
+> **运行中的陈旧进程它发现不了** —— 那正是本次的形式。
+
+**决策一（对等改造）**：把"设备侧自主变化 → 上位机跟随"这条语义在 MuJoCo 链路上做**对等**实现。
+`simulation/mujoco/server.py` 新增 `SET` / `S<n>=` / `JOY`（单轴 + 整帧）三入口、
+`# SERVO` 编码、两条上报路径分流，以及 `jr_busy` + `report_dirty` 让位闸门。
+
+**决策二（公式只有一份真值）**：摇杆步长以固件 `core/joystick.c::joystick_delta()` 为真值，
+Go `sim.go::joystickDelta` 与新增的 Python `server.py::joystick_delta` **逐值同式**。
+⚠️ Python 侧 `beyond // 30` 与 C/Go 的向零取整**同值仅当 `beyond >= 0`** —— 该前提由
+`raw` 先被钳到 0..1023 保证，注释里钉住了这一点。
+单测表含两条**真机实测交叉验证**的用例（`(9,100)→+5`、`(7,0)→+8`）：
+只测自己写的表等于自证，必须有外部读数。
+
+**决策三（容差按链路登记，不追求统一小数）**：MuJoCo 有重力 + 有限 PD 增益，
+臂停在**力矩平衡处**而非命令角 ⇒ 存在**物理静态偏差**：
+实测 elbow `Δ=0.551°`、shoulder `Δ=0.274°`、base/gripper `Δ=0.000°`，
+且 **3s 与 6s 读数完全一致**（是稳态误差，不是"没收敛"）。
+⇒ `verify_device_follow.mjs` 的 `MUJOCO_ACK_TOL = 1.0`（sim / serial 仍用默认 0.15），
+容差来源写进断言文案 `ackTolNote`，随 `--ack-tol` 可覆盖。
+
+**复盘：废弃"空载开机位自校准"方案（自我推翻）**。
+首跑 3 条 FAIL（Δ≈0.6°）时，第一反应是"用开机静态偏差自校准容差"：
+`ackTol = 开机偏差 + 0.25`。复跑得出 0.451° 仍失败（实差 0.550），
+且**两次开机测量给出 0.201° 与 0.59°** —— 不可复现。原因是开机快照取在 `t≈0.5s`，
+**臂还在从初始 qpos 往平衡态松弛**。
+⇒ 拿一个自身不可复现的量当真值，等于把噪声焊进判据。改为显式常量并写明理由。
+
+**两处刻意保留的链路间不对称**（判据是"由谁发出"，不是"长什么样"，详见 `serial-v1.md` §3.2）：
+
+| | `SET` 的 `origin` | `STATUS` 的翻译层 |
+|---|---|---|
+| `serial` | `command`（固件 `external=false`，不上报） | `serial.go::execStatus` 先翻译成一行 `STATE` |
+| `sim` / `mujoco` | `device`（走 `# SERVO`） | `ParseReply` 直接判为 `ReplyServo`（实际角） |
+
+`SET` 归属不同的理由：真机链路上 `SET` 只可能是 `JR` 的翻译产物；
+而 `sim` / `mujoco` 直接处理 `JR`、从不拆 `SET`，故收到的 `SET` 必来自调试 / 验收脚本。
+
+**只改一个文件就解决可移植性缺陷**：`config.yaml` 里写死的 `C:/Users/lx176/...`（那台机器
+已不存在）改为经 `cfg.ResolveMujocoPython` 解析（显式配置 → `ARMPILOT_MUJOCO_PYTHON` →
+用户目录下的隔离环境 → PATH 的 `python`）。新增三链路各一份配置：`config.yaml`(sim) /
+`config.mujoco.yaml`(mujoco) / `config.serial.yaml`(serial)，共用 8090 ⇒ 不能同时启动。
+
+**验收（现跑现取）**：`verify_device_follow.mjs` sim **23/23** · mujoco **22/22**（连跑 3 次稳定）·
+serial **23/23**（真机）· 前端 DOM 读表 **9/9** · pytest `tests/sim/test_server.py` **33 passed** ·
+pytest 全量 **214 passed** · `go vet` 干净 · `go test ./...` 5 包全 ok · `tsc -b --force` 0 error ·
+vitest **439 passed**。
+
+**遗留**：MuJoCo 的静态偏差是**参数化物理**（Level 3→4，增益/质量非本台标定）的必然结果，
+不是模型缺陷。若要把它压到 0.1° 量级，正确做法是给物理参数做标定（或加积分项），
+而不是放宽判据 —— 本次只是**把容差按链路登记清楚**，没有掩盖它。
 
 ## D80 · 夹爪（S6）标定方向修正：真机 **S6=40 张开 / S6=130 闭合**，与旧标定正好相反
 
