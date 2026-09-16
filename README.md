@@ -47,8 +47,9 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 
 | 原则 | 落地方式 |
 |---|---|
-| **唯一真值源** | 尺寸 / 关节 / 限位 / 标定只存在于 `MeArm-3D/config/robot.yaml`，前端、Go 后端、MuJoCo 生成器**都读它**，代码里禁止硬编码 |
-| **先量后改** | 机构参数由「相机照片 + 舵机逐度扫描」反解得到，**实测推翻假设**（最初按固件命名推定的肩/肘角色是错的） |
+| **唯一真值源** | 尺寸 / 关节 / 限位 / 标定只存在于 `MeArm-3D/robot-package/<id>/model/robot.yaml`，物理量只存在于同包 `physics/physics.yaml`；前端、Go 后端、MuJoCo 与 URDF 生成器**都读它**，代码里禁止硬编码 |
+| **真值随包走** | 每台机器人一个包（`robot-package/<id>/`）：真值 / 运动学引擎 / 物理量 / 测试 / 工具全在包内。`config/robots.yaml` 只剩**选择器指针**（只有"加载谁"和"文件在哪"），路径一律由 `robopkg.declared_path()` 解析 |
+| **先量后改** | 机构参数由「相机照片 + 舵机逐度扫描 + 3D 结构 STEP 反解」三方交叉得到，**实测推翻假设**（最初按固件命名推定的肩/肘角色是错的；夹爪标定方向也被真机实测推翻，见 §6.3） |
 | **不许伪造** | 物理仿真显式声明「标定层次」，能力边界（如无位置回读）在文档与 UI 中明确写出 |
 | **真值冻结** | 运动学 / 物理语义核心哈希入库，**改外观放行、改真值报错**，必须有意识地解冻 |
 | **可验收** | 每个阶段都有可复现的 pass/fail 判据与量化数字，不靠目视 |
@@ -85,12 +86,17 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
                          └──────────────────────────────────────┘
                                             ▼
                           底座(S9) · 左舵(S8) · 右舵(S7) · 夹取(S6)
+                          ⚠️ 以上是**固件命名**；运动学角色见 §6.3（S9 底座 / S7 肩 / S8 肘 / S6 夹取）
 ```
 
 - **8080 与 8090 刻意错开** ⇒ 两套前端可同时运行。
 - 两条路径最终都归一化为**同一套文本指令**下发固件，因此行为完全一致。
 - MuJoCo 物理仿真作为 `device` 接口的**第三实现**（`sim | serial | mujoco`）接入，
   协议层 / WebSocket / controller / 前端**全部零改动**。
+- `robot-package/<id>/model/robot.yaml` + `physics/physics.yaml` 是**唯一真值**；
+  由它派生出**两条生成链**（都是产物，改真值必须重新生成）：
+  `gen_model.py` → MJCF（`simulation/mujoco/mearm.xml`）·
+  `gen_urdf.py` → 标准 URDF（`robot-package/mearm-v1/urdf/mearm-v1.urdf`）。
 
 ---
 
@@ -100,7 +106,7 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 |---|---|---|---|
 | [**MeArm-Device**](MeArm-Device) | ATmega328P 裸机固件 | C/C++ · avr-libc · 直接寄存器 · PlatformIO(工具链) · avrdude | ✅ 零警告，指令回归 67/67 |
 | [**MeArm-RemoteControl**](MeArm-RemoteControl) | 串口 → Web / TCP 网关 | Go 1.21 标准库 · `//go:embed` · RFC6455 · 内嵌 three.js 前端 | ✅ 门控 ~13ms，端到端 ~10ms |
-| [**MeArm-3D**](MeArm-3D) | 数字孪生 + 关节级后端 + 物理仿真 | React 19 · TS · Vite · Three.js(R3F) · Zustand · Go 1.21 · MuJoCo 3.13 | ✅ Phase 1–14 + M1–M10 |
+| [**MeArm-3D**](MeArm-3D) | 数字孪生 + 关节级后端 + 物理仿真 | React 19 · TS · Vite · Three.js(R3F) · Zustand · Go 1.21 · MuJoCo 3.13 · URDF/STEP | ✅ Phase 1–14 + M1–M10 + 包化重构 Phase 0–2 |
 
 ### 3.1 MeArm-Device · 裸机 AVR 固件
 
@@ -125,8 +131,10 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
   异步事件统一以 `# ` 开头，供上位机门控区分 —— 这是网关侧 ACK 门控能成立的前提。
 - **⚠️ AVR 内存铁律**：ATmega328P 仅 2 KB RAM，`avr-gcc` 默认把字符串字面量放进 `.data`（RAM）。
   本工程所有字面量走 `PSTR()` + `_P` 变体函数、所有常量表走 `PROGMEM` + `pgm_read_*`。
-  修复后：`.data` ≈ 98 B · `.bss` = 344 B · **RAM ≈ 442 B，栈余量 ≈ 1606 B** ·
-  **FLASH ≈ 11052 B（34%）**，零警告。
+  当前：`.data` 138 B · `.bss` 706 B · **RAM 844 B，栈余量 ≈ 1204 B** ·
+  **FLASH 12,848 B（≈40%）**，零警告。
+- 串口发送**不忙等**：TX 走中断驱动的环形缓冲，「发完才返回」的老写法会让主循环在
+  高波特率下丢字节；改为入队即返回后，连续指令不再丢。
 - 上位机回归：`python tools/host_verify.py COM4 115200` → **67/67 PASS**。
 
 ### 3.2 MeArm-RemoteControl · 串口 → Web / TCP 网关（`arm-web`）
@@ -151,32 +159,42 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 
 | 能力 | 说明 |
 |---|---|
-| 唯一模型源 | `RobotModel` 从 `robot.yaml` 加载，几何 / 运动学 / 限位 / 标定全部由配置派生 |
+| 唯一模型源 | `RobotModel` 从包内 `model/robot.yaml` 加载，几何 / 运动学 / 限位 / 标定全部由配置派生 |
+| 机器人切换 | 活动机器人是 **store 状态**（非模块常量）：初值来自 `config/robots.yaml`，切换有守卫；`hello` 只互检、**不静默切换** |
 | 3D 场景 | `buildRobotObject3D` 按件生成（倒角板 / 舵机 / 轴销 / 夹爪轮廓），支持**实拍照片纹理贴图** |
 | 正向运动学 | `fk.ts` 与 Three.js 渲染矩阵**互相独立**、交叉验证 |
-| 逆运动学 | `ik.ts` 平面 2R 解析解，错误码 `OUT_OF_WORKSPACE` / `JOINT_LIMIT`，多解 `elbow-up/down/nearest` |
+| 逆运动学 | 包内 `ik.ts` 平面 2R 解析解，错误码 `OUT_OF_WORKSPACE` / `JOINT_LIMIT`，多解 `elbow-up/down/nearest` |
 | 关节控制 | 逐关节滑杆 + 角度限位 + 舵机标定换算 |
 | 末端目标 | XYZ 直输 + **鼠标真实拖拽**（拖动平面在 pointerdown **冻结**，越界不钳位） |
+| 末端目标安全参数 | 判据容差（≤1°）· **球壳内径覆写**（≥0.1 mm，只做前置检查）· **球壳外径覆写**（1–160 mm，前置检查**并真正传入 `ik.ts` 参与 `cosAlpha` 求解**）· 改动**实时重解**。约束的是**腕枢轴**距离 `d`，不是 TCP 到原点的距离 |
 | 传输抽象 | `RobotTransport` 接口：`MockTransport`（模拟有限角速度 / 延迟 / 丢帧 / 限位拒绝）与 `WebSocketTransport` |
 | 链路反馈 | Phase 11 逐关节带符号偏差条 + 误差趋势 + 健康结论；Phase 12 **实际臂幽灵**（半透明第二条臂，露出的就是滞后量） |
 | 示教 | Phase 13 `Record / Play / Pause / Stop / Clear / Export / Import`，录 `commandJoints`（不含链路时延），回放复用既有命令通道 |
 | 状态仓库 | Zustand 单一状态源 + `transportBridge`（尾沿合并 33 ms / 回推只写 `actual` / 回环打破 / 重连补发） |
+| 包边界 | `corePackageBoundary.test.ts` **双向断言** Core ↔ 包的依赖边：多一条少一条都失败，防止 Core 反向依赖某台机器人 |
 
 **后端（Go 1.21，自包含 module）**
 
 | 包 | 职责 |
 |---|---|
-| `internal/robot` | 读 `robot.yaml`；关节 ↔ 舵机换算；限位校验（唯一「真值」入口） |
+| `internal/cfg` | 配置解析（`config.yaml` / `config.serial.yaml`）与启动期一致性核对 |
+| `internal/robot` | `registry.go` 读 `config/robots.yaml` 选择器（**只做选择**，禁止 `if robot ==`）→ `robot.go` 读包内 `model/robot.yaml`；关节 ↔ 舵机换算；限位校验（唯一「真值」入口） |
 | `internal/protocol` | JSON / `JR` / `OK JR` / `STATE` / `ERR` 编解码（不认识机械结构） |
 | `internal/controller` | **唯一「懂机械臂」处**：ACK 门控 · latest-wins · 标定核对 · 状态发布 |
 | `internal/device` | `sim.go`（内置假固件）· `serial.go`（真串口）· `mujoco.go`（Python 子进程） |
 | `internal/wsserver` | 标准库 RFC6455 服务端 · 路由 · 广播 · 两层心跳 |
 
-**物理仿真（MuJoCo 轨 M1–M10）**
+**模型生成链与物理仿真（MuJoCo 轨 M1–M10）**
 
-- MJCF **由 `robot.yaml` + `physics.yaml` 生成**（`gen_model.py`），**禁止手改 XML**，并有测试盯同步。
+- **两条生成链，产物禁止手改**：`gen_model.py` → MJCF（`simulation/mujoco/mearm.xml`）·
+  `gen_urdf.py` → 标准 **URDF**（`robot-package/mearm-v1/urdf/mearm-v1.urdf`，供 Three.js / ROS / MoveIt 等标准工具消费）。
+  两条链都有测试盯着「与配置同步」，且生成器必须住在包内。
+- **3D 结构回溯**：`robot-package/mearm-v1/3d-structure/mearm3Dasm.STEP` 是**几何/装配真值**，
+  配置里未知的尺寸由它反解；STEP 一律走 **OCCT 参考实现**，不写自研解析器。
 - 三层时间步解耦（物理 1 kHz / 控制 100 Hz / 渲染只读），批量步进与渲染帧率**按位可复现**。
 - 用 **Vite SSR 桥**把前端真实 `ik.ts` 当**独立裁判**（不是用 Python 再写一份自证）。
+- **统一 Sim2Sim 框架**：判据只有**一份**（`runSim2Sim(robot)`），容差**按机器人登记且必须写明理由**；
+  黄金数据把**行为**落盘，判据从「两套实现互相比对」改成「与冻结时一致」。
 - Level 声明机器可检查（`calibrated == false`），不伪造「已标定」。
 
 ---
@@ -196,6 +214,10 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 | 数字孪生（关节级） | — | — | ✅ |
 | FK / IK | — | — | ✅ |
 | 鼠标拖拽末端 | — | — | ✅ |
+| 末端安全参数（球壳内径 / 外径覆写） | — | — | ✅ |
+| 多机器人分派（注册表，禁 `if robot ==`） | — | — | ✅ |
+| 标准 URDF 导出 | — | — | ✅ |
+| STEP 装配体反解几何 | — | — | ✅ |
 | 示教录制 / 回放 | — | — | ✅ |
 | 链路误差面板 / 幽灵臂 | — | — | ✅ |
 | MuJoCo 真实物理仿真 | — | — | ✅ |
@@ -213,8 +235,11 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 | 数字孪生前端 | **React 19 · TypeScript 5.9 · Vite 8 · Three.js · React Three Fiber · @react-three/drei · Zustand** |
 | 关节级后端 | **Go 1.21**（标准库 `net/http` + RFC6455 WebSocket + `yaml.v3`） |
 | 物理仿真 | **MuJoCo 3.13（Python）** · MJCF 由 YAML 生成 · `numpy` |
-| 上位机工具 | Python 3（numpy / Pillow / pyserial / pytest）· Node.js（e2e 与链路探针） |
-| 测试 | **Vitest**（单元 / 验收）· `go test` · **pytest**（物理仿真）· 零依赖 **CDP e2e**（无头 Edge/Chrome）· Node 端到端脚本 |
+| 模型描述 | **URDF**（`gen_urdf.py` 生成，标准工具可消费）· **MJCF**（`gen_model.py` 生成） |
+| CAD / 结构 | **STEP 装配体**（AP214）· **OCCT 参考实现**解析（`step_obb.py` / `step_report.py`）· 按装配体包围盒反解连杆几何 |
+| 包契约 | 自研 `robopkg`（manifest 解析 / `declared_path()` / 语义内容哈希 / 校验 CLI），随仓提供、**无第三方依赖** |
+| 上位机工具 | Python 3（numpy / Pillow / pyserial / pytest / OCCT）· Node.js（e2e 与链路探针） |
+| 测试 | **Vitest**（单元 / 验收 / Sim2Sim）· `go test` · **pytest**（包契约 / 仿真轨）· 零依赖 **CDP e2e**（无头 Edge/Chrome）· Node 端到端脚本 |
 | 图像 | Otsu 分割 · 对称 Chamfer 拟合 + Hooke-Jeeves · PCA 定角 · homography 透视校正 |
 
 ---
@@ -230,7 +255,10 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 | MeArm-3D | Phase 1–14（模型 / 3D / FK / IK / 拖动 / Mock / Go WS / 真串口 / 反馈 / 幽灵 / 示教 / 被动腕） | ✅ |
 | MeArm-3D | MuJoCo 物理轨 M1–M10 | ✅ |
 | MeArm-3D | 照片纹理贴图（D63 / D64 / D66 / D68 / D69） | ✅ |
-| MeArm-3D | ADR 决策记录 D1–D70 | ✅ 67 条 |
+| MeArm-3D | Robot Package 重构 Phase 0–2（只读分析 / Core 边界 / 真值·工具·实现·测试随包走） | ✅ |
+| MeArm-3D | 3D 结构（STEP）接入 + 标准 URDF 生成链 | ✅ 产物入库 · 测试盯同步 |
+| MeArm-3D | 末端目标安全参数改版（删限位调节 / 加球壳外径覆写 / 修 d 口径不一致） | ✅ |
+| MeArm-3D | ADR 决策记录 D1–D80 | ✅ 77 条 |
 
 ### 6.2 验收数据（可复现）
 
@@ -238,29 +266,37 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 
 ```
 类型检查      tsc -b                        0 error
-单元/验收测试  vitest run                   318 / 318 PASS（24 文件）
-后端单测      go test ./...                 65 / 65 PASS（5 包）+ go vet 干净
-浏览器 e2e    node tests/e2e/ui-smoke.mjs   88 / 88 PASS
-物理仿真      pytest tests/sim              147 / 147 PASS（12 文件）
-生产构建      vite build                    1,332.32 kB（gzip 378.73 kB），探针 0 泄漏
+单元/验收测试  vitest run                   434 / 434 PASS（33 文件）
+后端单测      go test ./...                 76 PASS（5 包）+ go vet 干净
+浏览器 e2e    node tests/e2e/ui-smoke.mjs   87 / 88 PASS（1 项为测试时序问题，见下注）
+仓库 Python   pytest -q（仓库根）            198 PASS（core/tests 31 · tests 160 · robot-package 7）
+  其中仿真轨   pytest tests/sim              151 PASS（13 文件）
+包契约        robopkg validate --all        1 个包全部通过 · 内容哈希 0780e71c…（35 个文件进哈希）
+生产构建      vite build                    1,358.40 kB（gzip 389.62 kB）
 
-FK ↔ Three.js   200 组随机位姿              末端最大误差 8.673e-14 mm
+FK ↔ Three.js   200 组随机位姿              末端最大误差 8.710e-14 mm
 FK(IK(XYZ))     2000 组随机可达位姿          最大残差 1.180e-13 mm（失败 0 组）
-MJCF 结构       gen_model.py                9240 B · nq=5 nv=5 njnt=5 nu=4
-                                            nbody=8 ngeom=34 nexclude=5 neq=1 ntendon=1 · 0.2173 kg
+拖动连续性      300 点跟随                  最大误差 9.210e-14 mm · 支解切换 0 次
+MJCF 结构       gen_model.py                9312 B · nq=5 nv=5 njnt=5 nu=4
+                                            nbody=8 ngeom=34 nexclude=5 neq=1 ntendon=1 · 0.1415 kg
+URDF 结构       gen_urdf.py                 10,521 B · 7 link / 10 joint / 6 inertial / 6 collision / 26 visual
 HOME 位 TCP     [115.0335, 0, 109.2236] mm  闭式解与前端 IK 逐位吻合
 重力对照        无驱动 3 s                  Δshoulder 32.095° / Δelbow 30.990°（Δbase = Δgripper = 0.000°）
 接触力判据      dist = +1.353 mm            qfrc_constraint 非零 · 禁用台面后 TCP 下落 14.62 mm
 跨进程确定性    run.py --demo 跑两遍         12 行数值载荷逐字相同（seed=0）
 ```
 
+> 注：e2e 的 1 项失败是「页面无控制台错误」——该段测试**故意停掉后端**来验证自动重连，
+> 浏览器必然在停机窗口留下一条 `ERR_CONNECTION_REFUSED` 日志。它是测试自身的时序敏感项，
+> 与产品行为无关（87 项功能断言全过）。
+
 **MeArm-Device**
 
 ```
 构建          avr-gcc + avrdude             零警告
-FLASH                                        ≈ 11052 B / 32 KB（34%）
-RAM                                          ≈ 442 B（.data 98 B + .bss 344 B）· 栈余量 ≈ 1606 B
-指令回归      python tools/host_verify.py   67 / 67 PASS
+FLASH                                        12,848 B（text 12,710 + data 138）/ 32,256 B 可用（≈40%）
+RAM                                          844 B（.data 138 + .bss 706）/ 2 KB · 栈余量 ≈ 1,204 B
+指令回归      python tools/host_verify.py   67 / 67 PASS（需真机串口）
 ```
 
 **MeArm-RemoteControl**
@@ -282,6 +318,18 @@ RAM                                          ≈ 442 B（.data 98 B + .bss 344 B
   自由度计数口径与台面高度。
 - **肩标定增益仍有 −13.1% 偏差**，但 `tools/verify_calib_repro.py` 判定**跨批测量本身不可复现**
   （极差 10.8% / 52.9% > 5% 容差）⇒ 此时改模型或改标定表都不成立，**唯一入口是重布台面重测**（A3）。
+- **夹爪标定方向被真机推翻（D80）**：真机实测 **S6=40° 张开 / S6=130° 闭合**，与旧标定表
+  （`servo = θ + 40`，θ=0 完全闭合）**恰好相反** ⇒ 网页拖到「张开」时真机在闭合。
+  关键判据：**网页 3D 显示是对的，错的是标定表**，所以症状表现为「虚拟臂正常、真机反向」。
+- **球壳安全参数约束的是「腕枢轴」距离 `d`，不是 TCP 到原点的距离**：
+  `d = hypot(r − pivotR − toolOffset[0], z − pivotZ − toolOffset[1])`，**球心在肩枢轴**。
+  同一个点，`ik.ts` 口径算出 111.542 mm，而 store 里另一份自研几何算成 92.159 mm
+  ——**差 19.4 mm 且不报错**，症状是「明明是范围内却被判越界」。
+  修法不是对齐数字，而是**删掉第二份几何、改为转发唯一实现**（与「同一个量只能有一套口径」同源）。
+  ⚠️ 两个推论：**「臂展 160」≠「能伸到 160 mm 远」**（TCP 径向恒比腕枢轴多 40 mm）；
+  UI 上 1–160 是**几何球壳**的范围，而关节限位把它裁到实际有效域 **`d ∈ [44.17, 139.27]`**。
+- **几何真值来自 3D 装配体（STEP）**：未知尺寸由 OCCT 解析装配体反解，
+  而非按照片目测；STEP 解析一律用参考实现，不写自研解析器。
 
 ---
 
@@ -306,15 +354,17 @@ start.bat              # 前置检查 + 端口探测 + 起前后端 + 打印本�
 
 ### 7.3 驱动真实机械臂
 
-```bash
-# 1) 烧录固件（Uno 接在 COM4）
-cd MeArm-Device && scripts\build_upload.bat COM4
+```bat
+REM 1) 烧录固件（Uno 接在 COM4）：预检 → 编译 → 烧录；缺依赖会先一次列全再拒跑
+cd MeArm-Device && start.bat flash COM4
 
-# 2) 用真机配置启动关节级后端（config.yaml 默认是 sim，不会碰硬件）
-cd ../MeArm-3D/backend && go run . -c config.serial.yaml
+REM 2) 用真机配置启动关节级后端（默认 config.yaml 是 sim，不会碰硬件）
+cd ..\MeArm-3D\backend && go run . -c config.serial.yaml
 
-# 3) 前端 Connection 面板 → ws://localhost:8090/ws/joint → Connect → 「关节控制」点 Real Robot
+REM 3) 前端 Connection 面板 → ws://localhost:8090/ws/joint → Connect → 「关节控制」点 Real Robot
 ```
+
+> 点 Real Robot 时后端会**核对链路末端**：末端不是 `serial` 就**拒绝切换并给出原因**（不留静默）。
 
 ### 7.4 物理仿真（MuJoCo）
 
@@ -331,6 +381,18 @@ cd MeArm-RemoteControl
 build.bat            # Windows；Linux/macOS 用 bash build.sh 或 make
 arm-web.exe -c config.yaml
 # 浏览器 http://127.0.0.1:8080    局域网 telnet <IP> 9001
+```
+
+### 7.6 校验机器人包 / 重新生成产物
+
+```bash
+cd MeArm-3D
+python core/python/robopkg/cli.py validate --all    # 包契约（路径 / 能力 / 生成器是否真的存在）
+python core/python/robopkg/cli.py show mearm-v1     # 摊开推导结果（dof / qpos / 执行器 / 内容哈希）
+
+# 改过真值后必须重新生成产物，否则「与配置同步」的测试会失败
+python robot-package/mearm-v1/tools/gen_model.py    # → simulation/mujoco/mearm.xml
+python robot-package/mearm-v1/tools/gen_urdf.py     # → robot-package/mearm-v1/urdf/mearm-v1.urdf
 ```
 
 ---
@@ -351,21 +413,28 @@ MeArmPilot/
 │   ├── web/static/               #    内嵌前端（three.js 双摇杆 + 角度面板 + 回显终端）
 │   └── tools/                    #    e2e-sim.js · tcp-test.js · headless-joystick-test.js
 └── MeArm-3D/                     # ③ 数字孪生 + 关节级后端 + 物理仿真
-    ├── config/                   # robots.yaml —— 只放「选择器指针」（默认机器人 id）
-    ├── robot-package/            # ★ 每台机器人一个包：模型真值 / 运动学 / 物理 / 测试 / 工具
-    │   ├── mearm-v1/             # model/robot.yaml（运动学真值）· physics/ · kinematics/ · tests/
-    │   └── so-arm101/            # 官方 SO-ARM101 资产（逐字节原样，禁止修改）
-    ├── core/                     # Core 层：robopkg（manifest / declared_path / 校验）· baseline · tools
+    ├── config/                   # robots.yaml —— 只放「选择器指针」（默认机器人 id + 文件路径）
+    ├── robot-package/            # ★ 每台机器人一个包：真值 / 运动学 / 物理 / 测试 / 工具 / URDF
+    │   └── mearm-v1/             #   manifest.yaml（身份 · 能力声明 · 指针）
+    │                             #   model/robot.yaml（运动学真值）· physics/physics.yaml（物理量真值）
+    │                             #   kinematics/（engine.ts + ik.ts）· urdf/mearm-v1.urdf（产物）
+    │                             #   3d-structure/mearm3Dasm.STEP（几何真值）· tests/（用例 JSON + 包内测试）
+    │                             #   tools/（20 个：生成 / 校验 / 相机标定 / 真机操作）
+    ├── core/                     # Core 层（不属于任何机器人）：python/robopkg（manifest 解析 ·
+    │                             #   declared_path 路径解析 · 语义内容哈希 · 校验 CLI）· baseline · tools
     ├── frontend/                 # React 19 + Three.js（robot / components / store / tests）
-    ├── backend/                  # Go 关节级服务（robot / protocol / controller / device / wsserver）
-    ├── simulation/mujoco/        # MJCF 生成器 + 模型 + 服务 + Viewer + 记录
+    ├── backend/                  # Go 关节级服务（cfg / robot / protocol / controller / device / wsserver）
+    ├── simulation/mujoco/        # MJCF（产物）+ 仿真服务 + Viewer + 记录
     ├── tests/sim/                # MuJoCo 轨验收（pytest）
-    └── docs/                     # 坐标系 / 模型结构 / 真机实测 / ADR 决策 / 采集指南 / 串口协议基线
+    └── docs/                     # 坐标系 / 模型结构 / 真机实测 / ADR 决策 / STEP 反解 / 安全参数 / 采集指南
 ```
 
 > ⚠️ **真值随包走**：`config/` 只剩**选择器**（`robots.yaml` 只有指针，没有数值）；
 > 运动学 / 标定 / 限位在 `robot-package/<id>/model/robot.yaml`，
 > 物理量在 `robot-package/<id>/physics/physics.yaml`。
+>
+> ⚠️ **产物与真值分开**：`urdf/` 与 `simulation/mujoco/*.xml` 都是**生成物**（不进内容哈希），
+> 改真值必须重新生成，否则「与配置同步」的测试会失败。
 
 ---
 
@@ -380,7 +449,13 @@ MeArmPilot/
   「幽灵臂」证明**链路走通了**，**不**证明物理到位。
 - **物理仿真的 Level 声明机器可检查**（`calibrated == false`）：当前是「参数化物理」，
   尚未做真机逐点标定，目标是 3 → 4 而非 5。
-- **肩标定增益偏差 −13.1% 未解决**，且跨批测量不可复现（详见 §6.3）。
+- **球壳安全参数是「前置检查 + 求解覆写」，不是物理限位**：内径只在前置检查里拒单
+  （`ik.ts` 里 `reachMin` 恒为求导值、不可覆写）；外径既做前置检查、**也真正传进 `ik.ts`**
+  参与 `cosAlpha` 求解。两者都不改变几何，只是把「拒绝」或「夹紧」的位置挪一挪。
+- **UI 的 1–160 mm 是几何球壳范围，不是有效工作域**：关节限位把它裁到
+  `d ∈ [44.17, 139.27]`，所以外径填 150 / 160 **等于没有覆写**。
+- **肩标定增益偏差 −13.1% 未解决**，且跨批测量不可复现（详见 §6.3）；
+  夹爪标定方向已于 D80 依真机实测修正。
 
 ---
 
@@ -392,11 +467,18 @@ MeArmPilot/
 | 固件指令协议与内存铁律 | [`MeArm-Device/README.md`](MeArm-Device/README.md) |
 | 串口网关 / ACK 门控 / 性能 | [`MeArm-RemoteControl/README.md`](MeArm-RemoteControl/README.md) |
 | 数字孪生全貌与阶段验收 | [`MeArm-3D/README.md`](MeArm-3D/README.md) |
+| 机器人包契约（真值 / 能力 / 指针） | [`MeArm-3D/robot-package/mearm-v1/manifest.yaml`](MeArm-3D/robot-package/mearm-v1/manifest.yaml) |
+| 包重构的分层边界与搬迁纪律 | [`MeArm-3D/docs/architecture/robot-package-phase0.md`](MeArm-3D/docs/architecture/robot-package-phase0.md) · [`phase1`](MeArm-3D/docs/architecture/robot-package-phase1.md) · [`phase2`](MeArm-3D/docs/architecture/robot-package-phase2.md) |
 | 坐标系 / 单位 / 运动学链 | [`MeArm-3D/docs/coordinate-system.md`](MeArm-3D/docs/coordinate-system.md) |
 | 模型结构（几何 vs 运动学边界） | [`MeArm-3D/docs/model-structure.md`](MeArm-3D/docs/model-structure.md) |
+| 3D 结构（STEP）反解与运动学验证 | [`MeArm-3D/docs/STEP_KINEMATICS_VALIDATION.md`](MeArm-3D/docs/STEP_KINEMATICS_VALIDATION.md) |
+| 外观参数从哪里来 | [`MeArm-3D/docs/APPEARANCE_PARAMETERS.md`](MeArm-3D/docs/APPEARANCE_PARAMETERS.md) |
+| 末端目标安全参数（球壳内/外径、容差） | [`MeArm-3D/docs/target-guard-analysis.md`](MeArm-3D/docs/target-guard-analysis.md) |
+| 工作空间边界实测（有效域怎么量出来的） | [`MeArm-3D/docs/workspace-boundary.md`](MeArm-3D/docs/workspace-boundary.md) |
 | 真机实测记录与不确定度 | [`MeArm-3D/docs/hardware-measurement.md`](MeArm-3D/docs/hardware-measurement.md) |
-| 设计决策 ADR（D1–D70） | [`MeArm-3D/docs/decisions.md`](MeArm-3D/docs/decisions.md) |
+| 设计决策 ADR（D1–D80） | [`MeArm-3D/docs/decisions.md`](MeArm-3D/docs/decisions.md) |
 | 物理仿真怎么跑 / 判据纪律 | [`MeArm-3D/simulation/README.md`](MeArm-3D/simulation/README.md) |
+| 物理量真值（质量 / 摩擦 / 惯量） | [`MeArm-3D/robot-package/mearm-v1/physics/physics.yaml`](MeArm-3D/robot-package/mearm-v1/physics/physics.yaml) |
 | 串口 / WS 协议基线 | [`MeArm-3D/docs/serial-v1.md`](MeArm-3D/docs/serial-v1.md) |
 | 图像采集指南 | [`MeArm-3D/docs/texture-capture-guide.md`](MeArm-3D/docs/texture-capture-guide.md) |
 | 开发提示词记录 | [`docs/`](docs) |

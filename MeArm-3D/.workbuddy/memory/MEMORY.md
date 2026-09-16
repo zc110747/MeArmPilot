@@ -44,11 +44,21 @@
 
 ## 二、验收
 
-**完整命令见 `playbook.md` §11**。实测基线（2026-09-15）：
-`pytest -q` **198** · `test_baseline_frozen` **11** · `validate --all` ✓ ·
-前端 tsc 0 / vitest **401** · `go test ./...` 全绿 ·
-固件（AVR）FLASH **12848 B** / RAM **844 B**，零警告。
+**完整命令见 `playbook.md` §11**。实测基线（2026-09-16）：
+`pytest -q` **198**（core/tests 31 · tests 160 · robot-package 7）· `test_baseline_frozen` **11** ·
+`validate --all` ✓ · 前端 tsc 0 / vitest **434** · `go test ./...` **76** ·
+固件（AVR）FLASH **12848 B**（text 12710 + data 138）/ RAM **844 B**（.data 138 + .bss 706），零警告。
 
+- ★★ **证书型数字（测试计数 / 资源占用 / 残差）必须现跑现取，禁止照抄** ——
+  改代码或改 README 之前**先跑一遍**。本轮实测撞到两例：旧文档写「tsc 0 error」实际报 2 条，
+  旧 README 抄的计数落后三轮。**「上次是绿的」不是证据。**
+- ★ **同一批计数别抄进多份文档**：三份 README 各抄一份 `pytest/go/vitest`，
+  实测漂移成 147 / 161 / 318 / 425 四个版本。只在**一处**写绝对值，其余给指针或写判据。
+- ⚠️ **断言可能被同脚本的前一段破坏**：e2e 结尾断言「控制台无错误」，前面却**故意 kill 后端**
+  测重连 ⇒ 必然记 `ERR_CONNECTION_REFUSED`，结果**时序敏感**（两次 87/88 与 73/86）。
+  遇「随机失败」先查**断言前提**，而不是改产品代码。
+- ⚠️ **改写文档里的命令前先确认文件真的存在**：本轮发现 README 写的
+  `scripts\build_upload.bat` **根本不存在**（实为 `start.bat flash <COM>`）。
 - ⚠️ **`pytest` 只在仓库根成立**：从 `frontend/` 跑会输出 `no tests collected` **且 exit 0**
   ⇒ 只看退出码的脚本会读成"通过"。**不要**给 pytest 传目录参数（传了就绕过 `testpaths`）。
 - ⚠️ **限位端点不可精确到达**（整数度量化后可能落到限位外被拒 `ERR JOINT`）⇒ 取**限额内部**的值。

@@ -144,7 +144,7 @@ curl http://localhost:8090/healthz                  # {"device":"mujoco","linked
 ## 5. 验收数据（Phase 1–10，spec §36 / §42）
 
 ```
-生成器        gen_model.py              9316 B · nq=5 nv=5 njnt=5 nbody=8 ngeom=34 nu=4 nexclude=5 neq=1 ntendon=1
+生成器        gen_model.py              9312 B · nq=5 nv=5 njnt=5 nbody=8 ngeom=34 nu=4 nexclude=5 neq=1 ntendon=1
 模型总质量    Σ body_mass               0.1415 kg（2026-09-15：base/column 的 `[估算]` 质量按
                                          STEP 实测几何重算，0.2173 → 0.1415；见 physics.yaml §4）
 HOME 位稳态   MuJoCo                     TCP=[115.03, 0, 109.22] mm · ncon=0（无伪接触）
@@ -175,7 +175,7 @@ IK 交叉验证   120 随机可达点 → 前端真实 ik.ts → MuJoCo 复算
 跨进程确定性  run.py --demo 跑两遍         12 行数值载荷逐字相同（seed=0）
 记录          JSONL / CSV 回读             列与配置一致 · 数值等于当时状态 · sim_time 严格递增
 快速运动      Test D 峰值角速度            4.9165 rad/s（限速目标 10 rad/s，0.49×）
- ─── pytest 147 passed（12 文件）· go test 65 全绿 · vitest 318 passed · tsc 0 error · vite build OK ───
+ ─── pytest 151 passed（13 文件）· tests/sim2sim 9 passed · go test 76 passed · vitest 434 passed · tsc 0 error · vite build OK ───
 ```
 
 误差门槛来源：spec §20 要求 FK < 1 mm（初期 < 5 mm）。实测是 **1e-13 mm** 量级，
