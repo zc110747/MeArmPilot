@@ -42,6 +42,7 @@ import type {
 import { SOCKET_OPEN, webSocketFactory, type SocketFactory, type SocketLike } from './socket';
 import { realTimer, type TimerLike } from './timer';
 import {
+  ORIGIN_DEVICE,
   SERVER_DEVICE_STATUS,
   SERVER_ERROR,
   SERVER_HELLO,
@@ -413,11 +414,16 @@ export class WebSocketTransport implements RobotTransport {
     if (!joints || typeof joints !== 'object') return;
     this.counters.received += 1;
     this.lastState = { ...joints };
+    // ★ 来源只认**明确标注为 device** 的那一种，其余（含未知取值）一律按 command 处理。
+    //   宁可少跟随，也不要因为一个拼错的字符串把命令侧交给设备拖着走 ——
+    //   跟随的代价是命令侧被改写，判错方向比不跟随危险得多。
+    const origin = env.origin === ORIGIN_DEVICE ? ('device' as const) : undefined;
     const state = createRobotState(
       joints,
       endEffectorPose(this.model, joints),
       'real',
       env.timestamp ?? this.timer.now(),
+      origin,
     );
     for (const listener of this.stateListeners) listener(state);
   }

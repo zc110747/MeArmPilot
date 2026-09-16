@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,10 +62,10 @@ func New(cfg Config, ctl *controller.Controller) *Server {
 	}
 	s := &Server{cfg: cfg, ctl: ctl, clients: make(map[*client]struct{})}
 	// 控制器事件 → 广播到所有客户端（只挂一次，与客户端数量无关）
-	ctl.OnJointState(func(joints map[string]float64, at time.Time) {
+	ctl.OnJointState(func(joints map[string]float64, at time.Time, origin string) {
 		s.broadcast(protocol.ServerMessage{
 			Version: protocol.Version, Type: protocol.TypeJointState,
-			Timestamp: at.UnixMilli(), Joints: joints,
+			Timestamp: at.UnixMilli(), Joints: joints, Origin: origin,
 		})
 	})
 	ctl.OnError(func(code, message string) {
@@ -307,6 +308,21 @@ func (s *Server) handleMessage(c *client, raw string) {
 			}
 			c.Send(s.errJSON(protocol.CodeInternal, err.Error()))
 		}
+	case protocol.TypeDeviceCommand:
+		// 调试 / 验收直通：把一行原始设备指令（`JOY …` / `SET …`）发给链路末端。
+		// 回执不走这里 —— `JOY` 触发的 `# SERVO` 会经 device.Lines() 由
+		// controller 解析成 OriginDevice 状态后广播，与正常状态同一条路。
+		if strings.TrimSpace(m.Line) == "" {
+			c.Send(s.errJSON(protocol.CodeBadMessage, "device_command 缺少 line"))
+			return
+		}
+		if err := s.ctl.RawLine(m.Line); err != nil {
+			if re, ok := err.(*controller.RejectError); ok {
+				c.Send(s.errJSON(re.Code, re.Message))
+				return
+			}
+			c.Send(s.errJSON(protocol.CodeInternal, err.Error()))
+		}
 	case protocol.TypePing:
 		c.Send(s.pongJSON())
 	case protocol.TypeStatusRequest:
@@ -379,12 +395,18 @@ func (s *Server) helloJSON() string {
 	})
 }
 
+// stateJSON 是客户端接入 / status_request 时的状态快照。
+//
+// `Origin` 固定为 `command`：快照给的是"命令侧认为机器在哪"，
+// **不是**一次设备侧自主变化的通知。标错会让界面在每次重连时
+// 把命令悄悄对齐到快照值（跟随的语义被滥用）。
 func (s *Server) stateJSON(joints map[string]float64) string {
 	return mustJSON(protocol.ServerMessage{
 		Version:   protocol.Version,
 		Type:      protocol.TypeJointState,
 		Timestamp: nowMs(),
 		Joints:    joints,
+		Origin:    protocol.OriginCommand,
 	})
 }
 

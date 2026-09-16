@@ -143,7 +143,8 @@ MeArm-3D/
 │   └── tools/                    #   真值冻结 · 统一 Sim2Sim · 真机与链路探针：
 │       ├── freeze_baseline.py    #     ★ 冻结/校验运动学+物理真值（改外观放行，改真值报错）
 │       ├── run_sim2sim.py        #     ★ 统一 Sim2Sim 矩阵（`--all` 覆盖选择器全部机器人）
-│       ├── verify_serial_e2e.mjs #     真机端到端（opt-in）
+│       ├── verify_serial_e2e.mjs #     真机端到端（opt-in，相机做物理真值）
+│       ├── verify_device_follow.mjs #  ★ 设备侧自主变化 → 上位机跟随（**仿真/真机同一份脚本**）
 │       ├── park_sim_pose.mjs     #     ★ 造前提：把 sim 后端停在**指定位姿**（不含任何限位常量）
 │       ├── first_load_probe.mjs  #     ★ 首帧取证：CDP 取 `window.__armPilotFrames`
 │       └── ws_probe.mjs · lan_e2e_probe.mjs · set_joints.mjs   # WS / 局域网 / 关节设置探针
@@ -545,11 +546,16 @@ $PY core/tools/run_sim2sim.py --all               # 统一 Sim2Sim 矩阵（选�
 cd backend && go test ./...
 $PY core/tools/freeze_baseline.py                 # 真值冻结校验（不符退出码 1）
 $PY robot-package/mearm-v1/tools/gen_mearm_v1_baseline.py --check   # 黄金数据逐位复现
+node core/tools/verify_device_follow.mjs --config sim   # 设备侧自主变化→跟随（无需硬件）
 ```
 
-**最近一次全绿概要**（2026-09-14）：`tsc` 0 error · `vitest` 425 passed · `go test` 75 passed ·
-`pytest` 161+9+25 passed · e2e 84/84（隔离端口）· 真值冻结 ✅ · 4 份黄金数据逐位一致 ·
-`run_sim2sim.py --all` 覆盖 mearm-v1 + so-arm101。
+**最近一次全绿概要**（2026-09-16）：`tsc` 0 error · `vitest` 439 passed · `go test` 89 个顶层用例全绿 ·
+`pytest` 198 passed · 真值冻结 ✅ · 4 份黄金数据逐位一致 · `verify_device_follow.mjs` **23/23 PASS**
+（连跑 3 次稳定）· `run_sim2sim.py --all` 覆盖 mearm-v1 + so-arm101。
+
+> **真机的证书型数字**（`go test` 计数 / 固件资源占用 / 相机残差）**一律现跑现取**：
+> 三份 README 各抄过一份计数，实测漂移成 147 / 161 / 318 / 425 四个版本。
+> 只在**一处**写绝对值，其余给指针或写判据。
 
 > **Phase 9 最重要的一条结论**：真机固件**没有位置反馈**（`arm_get_angle()` 回的是固件记着的
 > **目标值**）。所以 `OK SET` / `STATUS` / 后端 `joint_state` **全都在说「我打算去哪」**，
@@ -638,6 +644,39 @@ JPEG 体积 +2.7%、反解残差 **69.76px**（其余帧 28~42）、肘帧间差
 > 因小臂存**绝对角**（平行四连杆解耦），**不再叠加肩角** —— 这是本次实测修正的核心。
 > 其中 `J3 滑杆 60°` 被 `elbow.limit.min = 108.441485` 钳位，正是「零位不可达 0°」的体现
 > （见 `docs/coordinate-system.md`）。
+
+### 设备侧自主变化 → 上位机跟随（新增）
+
+机械臂可以被**上位机以外**的手段改动：硬件摇杆、红外遥控、面板手拧、调试直控。
+如果上位机不知道，界面会继续显示一个**过时的位置** —— 用户看到的是一台不存在的机器。
+
+| 项 | 值 |
+|----|-----|
+| **两条上报路径**（核心设计） | `JR` 受理 → 推进 → `STATE …`（关节角，**命令引起**）<br>`SET`/`JOY`/`S<n>=` → 推进 → `# SERVO …`（舵机角，**设备侧变化**） |
+| 为什么不能合成一条 | 用 `STATE` 跑外部变化 ⇒ 拖滑杆时设备还在斜坡上，摇杆角会把滑杆**回拉到半路**；用 `# SERVO` 的**形状**去猜来源 ⇒ 前端只能猜，猜错就吃掉命令语义 |
+| **跟随由显式标注决定** | 后端 `ServerMessage.Origin`（`command` / `device`）→ 前端 `transportBridge` 见 `device` 才 `store.followDevice()`。未知取值**一律按 command**（宁可少跟随） |
+| 回环防护 | `followDevice` 期间置 `suppressCommandSend`，只覆盖那一次 `set` —— 否则每次摇杆上报都会反弹一条命令下来 |
+| **低优先级**（用户铁律） | 自主上报**让位于**交互指令，且**让位 ≠ 丢弃**：<br>固件 `arm_report_tick()` 排在 `cmd_poll()` **之后**，且只在 `uart_tx_used()==0`（TX 环全空）时才发；被挡下保留脏标志，发送那刻才取值 ⇒ latest-wins<br>sim `jrBusy` 在途抑制 + 命令了结后 `flushReport()` |
+| 仿真侧对等实现 | sim 新增 `SET` / `S<n>=` / `JOY`（**与固件同一公式** `2 + beyond/30`，clamp ≤10，`id==8` 反向）与 `STATUS` 兼容 ⇒ 无硬件也能端到端验证 |
+| 调试/验收入口 | WS `{"type":"device_command","line":"JOY 7 0"}` → `controller.RawLine`（**不做限位校验、不参与 ACK 门控**，语义 = 有人把线直接接在设备上敲命令） |
+| 离线验收 | `node core/tools/verify_device_follow.mjs --config sim` ⇒ **PASS 23 / FAIL 0**（连跑 3 次稳定）。**仿真与真机同一份脚本**，只差 `--config` |
+| 契约文档 | `docs/serial-v1.md` **§3.1**（`# SERVO` 上报）、**§5.3 第 5 条**（跟随必须由 `origin` 判定） |
+
+> **验收脚本的三个"前提"，缺一个就会产生假 FAIL**（都是第一版实测踩到的）：
+> ① 摇杆方向必须**从模型限位里挑行程更大的一侧** —— 肩关节 HOME `0.85°`、限位 `[-6.09, 49.45]`，
+> 向下只有 **6.9°** 行程，写死向下拨会在第一次之后就被限位钳住，然后被误报成"上报机制坏了"；
+> ② 命令目标与当前位置**相同时零位移 ⇒ 零状态帧**，"等收敛"拿到 `NaN`，看起来像"命令没被受理"；
+> ③ 候选目标必须**夹进限位内**，否则命令被同步拒掉（`ERR JOINT`）—— 同样是零状态帧。
+>
+> ⚠️ **让位闸门本身由 Go 单测证明**（`TestSimExternalReportYieldsToInflightJR`），脚本证明的是它的
+> **端到端可观测后果**。别指望脚本走到闸门：sim 的在途窗口只有 `LatencyMs`=15ms，且
+> `deliver()` 到期会用**绝对目标**覆盖舵机目标（建模选择，非缺陷）；真机 TX 环大部分时间也是空的。
+
+**⚠️ 待办（硬件不在手边，仅完成代码 + 仿真验证）**：夜间真机复跑
+`node core/tools/verify_device_follow.mjs --config serial`，并人工确认
+① 拨摇杆时串口出现 `# SERVO S6=.. S7=.. S8=.. S9=..`；② 网页滑杆与主臂跟随；
+③ 串口敲 `STATS`，`tx_drop` 保持 **0**（这是"上报让位没把 TX 环写爆"的**唯一独立证据** ——
+收发对账**不能**用来否定链路丢字节）。
 
 ### IK（Phase 5）
 
@@ -849,6 +888,7 @@ $PY robot-package/mearm-v1/tools/fit_pose.py .workbuddy/captures/w2_S7 --sweep b
 | 跟踪误差为什么是 0.02° 而不是 0（链路精度） | `docs/decisions.md` D31 · `docs/coordinate-system.md` §3.4 |
 | Phase 9 接真串口的落点与实测坑 | `backend/internal/device/serial.go` 注释 · `docs/serial-v1.md` §6.1 |
 | 真机端到端怎么跑、相机怎么当唯一真值 | `core/tools/verify_serial_e2e.mjs` · `robot-package/mearm-v1/tools/verify_pose.py` 头注释 · D34–D36 |
+| 拨摇杆/红外改动后界面怎么跟随、为何要分两条上报路径 | `docs/serial-v1.md` **§3.1 · §5.3 第 5 条** · `backend/internal/device/sim.go` 文件头 · `core/tools/verify_device_follow.mjs` 头注释 |
 
 ## 10. MuJoCo 物理仿真（`simulation/`）快速索引
 

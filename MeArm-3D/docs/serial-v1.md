@@ -67,6 +67,32 @@ RESET                # 全部回 90°
 回执契约：**每条指令恰好回一行**，合法 `OK ...`、非法 `ERR ...`；异步事件以 `# ` 开头
 （`# IR RAW=...`）。上位机门控以"非 `# ` 开头的行 = 应答"判定。
 
+### 3.1 设备侧自主变化的上报（`# SERVO`）—— **已实现**
+
+固件在**舵机被命令之外的手段**改动时主动上报一行：
+
+```
+# SERVO S6=88 S7=120 S8=92 S9=90
+```
+
+三个要点（缺一条就会用错）：
+
+1. **`# ` 前缀 = 异步事件**，因此它天然不参与"每条指令恰好回一行"的应答契约，
+   也不该拿它去放行某条在途命令的 ACK 门控。
+2. **它报的是舵机角，不是关节角** —— 固件不认识关节（标定真值只有
+   `robot-package/<id>/model/robot.yaml` 那一份）。换算由后端唯一那一处
+   （`protocol.ServoAnglesToJoints`）完成，与 `OK JR` 的标定核对共用同一张表。
+3. **触发条件只有"外部驱动"**：硬件摇杆（`joystick_scan()`）、红外遥控、
+   串口 `JOY` / `AUTO`。**命令驱动的运动（`SET` / `JR` / `RESET`）一律不上报** ——
+   那一路已有 ACK 与 `STATUS`，多报一份会让上位机把"命令侧"跟着实际位置拖走
+   （拖动滑杆时会看到滑杆被回拉）。
+
+**优先级低于一切命令应答**（这是硬要求，不是优化）：固件在主循环里
+**`cmd_poll()` 之后**才调用 `arm_report_tick()`，且**只在 TX 环完全为空时**才发；
+被挡下时保留脏标记、下一轮重新取值（latest-wins —— 不积压，也不补发旧姿态）。
+理由见 `bsp/uart.c` 文件头：应答被挤掉就等于"上位机认为机械臂没收到命令"，
+而那正是历史上最难查的一类故障。
+
 ## 4. v1 目标：关节级协议（新增，向后兼容）
 
 ArmsPilot 的虚拟机械臂天然工作**关节空间**。v1 让固件也理解关节空间，
@@ -140,7 +166,13 @@ FB <j1> <j2> <j3> <grip>             # 实际关节角反馈，用于 Actual / E
   "device": "sim", "connected": true }
 
 // 状态：关节角由链路末端从**舵机实际角反算**（不是命令回显）
-{ "version": 1, "type": "joint_state", "timestamp": 1757654321100,
+//
+// `origin` 说明这帧**由谁引起**（可选字段，缺省 = "command"：
+// 老前端不认识它也照常工作 —— 只更新 Actual、不跟随）：
+//   "command" — 本机命令的应答 / 状态快照   ⇒ 界面**不**跟随
+//   "device"  — 设备侧自主变化：摇杆 / 红外 / 面板手拧 / 调试直控
+//                                            ⇒ 界面**跟随**，把命令侧对齐过去
+{ "version": 1, "type": "joint_state", "timestamp": 1757654321100, "origin": "device",
   "joints": { "base": 0, "shoulder": 19.8, "elbow": 120.1, "gripper": 50 } }
 
 { "version": 1, "type": "pong",          "timestamp": 1757654321010, "seq": 42 }
@@ -177,7 +209,7 @@ WebSocket Client → Protocol(编解码) → Robot Controller → Device(sim | s
 | 链路末端 | `internal/device` | `sim`（假固件）/ `serial`（Phase 9） | 不认识关节语义（只收发字节行） |
 | 对外 | `internal/wsserver` | RFC6455 帧、路由、广播、心跳 | 不认识关节语义（只转发） |
 
-### 5.3 四条**必须做对**的语义（都有测试锁死）
+### 5.3 五条**必须做对**的语义（都有测试锁死）
 
 1. **`OK JR` 携带的是目标舵机角，不是实际位置。**
    它只用于**核对标定**（与本地标定算出的值比对，偏差 > 0.1° 报警告）。
@@ -198,6 +230,19 @@ WebSocket Client → Protocol(编解码) → Robot Controller → Device(sim | s
    同时服务端发 RFC6455 `ping`（浏览器自动回 `pong`）由服务端看门狗判死。
    ⚠️ 上一轮 ping 仍在途时**不得**重复发，否则超时判定会被自己不断推后。
 
+5. **要不要"跟随"必须由 `origin` 判定，不能由前端猜。**
+   设备侧的自主变化（硬件摇杆 / 红外遥控）必须让界面跟着走 —— 否则滑杆、主臂、
+   目标点全部停在旧值上，而画面**看不出任何异常**。
+   但两种"猜"的写法都不成立：
+   - 猜"Actual ≠ Command 就跟随" ⇒ 拖动时设备还在斜坡上，Actual 必然落后于 Command，
+     命令侧会被一路拉回半路位置（正是 `命令 → 状态 → 命令` 回环）；
+   - 猜"一律跟随" ⇒ 命令侧被实际值拖走，命令语义消失。
+   ⇒ 所以在协议里**标注来源**：只有 `origin === "device"` 才跟随。
+
+   ⚠️ 跟随的那条路径必须**抑制下发**（前端 `transportBridge.suppressCommandSend`），
+      否则每次摇杆上报都会触发一条命令下发 —— 变成"设备自己动 → 上位机把它推回去"
+      的对抗（验收里有专门一条断言钉住这一点）。
+
 ### 5.4 ⚠️ 链路精度 = 跟踪误差的可分辨下限
 
 `JR` 只保留 **1 位小数**（0.1°），因此：
@@ -213,14 +258,28 @@ WebSocket Client → Protocol(编解码) → Robot Controller → Device(sim | s
 
 ## 6. 待办（Phase 9 起）
 
-- [ ] 由 `config/robot.yaml` **生成**固件标定表（避免手抄导致双份真值）
+- [ ] 由 `robot-package/<id>/model/robot.yaml` **生成**固件标定表（避免手抄导致双份真值）
 - [ ] 固件 `core/cmd.c` 增加 `JR` / `STATE <关节>` 解析与回执
+- [x] 固件 `arm_report_tick()`：舵机被**外部手段**改动时主动上报 `# SERVO`（§3.1），
+      优先级低于命令应答（TX 环为空才发）
+- [x] 后端 `protocol.ParseReply` 识别 `# SERVO` / `STATUS` 为 `ReplyServo`（**实际角**），
+      与 `ReplyOKJR`（**目标角**）严格分流；`joint_state` 增加 `origin` 字段
 - [x] Go `internal/protocol` 增加关节级编解码 + 单测（Phase 8：`EncodeJR` / `EncodeOKJR` /
-      `EncodeState` / `ParseReply` / `ServoAnglesToJoints`，含"`ERR` 判定必须先于 `OK JR`"）
+      `EncodeState` / `EncodeServoReport` / `ParseReply` / `ServoAnglesToJoints`，
+      含"`ERR` 判定必须先于 `OK JR`"与"`OK SET` 不得当实际角"）
 - [x] `internal/device/serial.go` 落地真实串口（Phase 9：Windows 非重叠 I/O，**不用 `bufio`**；
       Uno DTR 复位静默窗口 `connect_settle_ms=2600` + 暖机包）
+- [x] `internal/device/sim.go` 补固件级外部入口（`SET` / `S<n>=` / `JOY`），
+      按"设备侧自主变化"路径上报 —— **不接真机也能端到端验证"摇杆 → 界面跟随"**
 - [ ] `MeArm-RemoteControl` 现有摇杆通道与关节通道并存，注意 ACK 门控饥饿问题
       （见 skill `arm-robot-serial` 关键坑 6：周期查询会饿死遥控流）
+- [ ] 真机验证（硬件到位后）：`node core/tools/verify_device_follow.mjs --config serial`
+      —— 拨动摇杆/红外 → 串口应出现 `# SERVO …`；网页滑杆应跟随；且串口敲 `STATS`
+      其 `tx_drop` 保持 0（这是"遥测没有挤占应答"的**唯一独立证据**，收发对账不算）
+- [x] 仿真侧对等实现 + 离线验收：`core/tools/verify_device_follow.mjs --config sim`
+      **PASS 23 / FAIL 0**（连跑 3 次稳定；仿真与真机跑同一份脚本，只差 `--config`）。
+      覆盖：单次拨动的方向/幅度、事件流（多帧）、命令在途插入拨动（命令优先 + 让位不丢）、
+      设备在坡上时命令夺回报通道（无"回拉"）、收尾复位
 
 ### 6.2 Phase 9 真机实测：**回执证明不了物理到位**
 
@@ -271,4 +330,8 @@ WebSocket Client → Protocol(编解码) → Robot Controller → Device(sim | s
 2. **Windows 非重叠 I/O 的读会立即返回 0 字节**（不是阻塞），照 `bufio.Scanner` 写会
    得到"读循环空转 100% CPU"或"半个包就当一行"。
 3. **不要用 `bufio`**：它会把"还没收到换行的一行"留在内部缓冲，超时判定的时间基准就错了。
-4. **状态应由固件主动上报**（周期 `STATE`），上位机轮询 `STATUS` 会与 ACK 门控互相饿死。
+4. **状态应由固件主动上报**，上位机轮询 `STATUS` 会与 ACK 门控互相饿死
+   （每次查询都要等回执，而回执要读循环消费，两边互锁）。
+   ✅ 已按**事件驱动**落地（比周期上报更省带宽）：固件只在舵机被
+   **命令之外的手段**改动时才发 `# SERVO`，且只在 TX 环完全空闲时发（§3.1）。
+   静止时零遥测流量。

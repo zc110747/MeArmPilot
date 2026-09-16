@@ -17,6 +17,7 @@ package controller
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,7 +49,12 @@ func DefaultConfig() Config {
 }
 
 // JointStateHandler 收到设备状态（关节角）。
-type JointStateHandler func(joints map[string]float64, at time.Time)
+//
+// `origin` 是这帧状态的**来源**（`protocol.OriginCommand` / `OriginDevice`），
+// 上层据此决定要不要让界面跟随：命令引起的状态只是回执，设备侧自主变化
+// （摇杆 / 红外 / 手拧）必须让 UI 跟着走。**不要**让上层自己猜 —— 见
+// `protocol.OriginCommand` 的注释（猜错的两种方式都会引入真实缺陷）。
+type JointStateHandler func(joints map[string]float64, at time.Time, origin string)
 
 // ErrorHandler 收到错误（限位拒绝 / 回执超时 / 设备异常）。
 type ErrorHandler func(code, message string)
@@ -149,7 +155,24 @@ func (c *Controller) handleLine(line device.Line) {
 			return
 		}
 		joints := c.stateFromValues(reply.Joints)
-		c.publishState(joints)
+		c.publishState(joints, protocol.OriginCommand)
+
+	case protocol.ReplyServo:
+		// 设备侧上报的**实际**舵机角 —— 说明下位机被命令之外的东西动了
+		// （硬件摇杆 / 红外遥控 / 面板手拧 / 调试直控）。
+		//
+		// 这是"上位机状态是否跟随"的入口：本机命令路径（JR）走的是 OK JR → STATE，
+		// 从不经过这里 —— 于是凡是走到这里的，都确实是**外部**变化，可以放心
+		// 让界面跟随，不会把"命令 → 状态 → 命令"的回环引回来。
+		//
+		// ⚠️ 换算只在这里做（`ServoAnglesToJoints`），与 OK JR 的标定核对共用
+		//    同一张 model 表 —— 设备不认识关节，绝不接受它报关节角。
+		// ⚠️ 不影响 ACK 门控：`#` 是异步事件，不是某条在途命令的应答（见 handleLine 开头）。
+		if !c.cfg.EchoJointState {
+			return
+		}
+		joints := c.mergeState(protocol.ServoAnglesToJoints(c.model, reply.ServoAngles))
+		c.publishState(joints, protocol.OriginDevice)
 
 	case protocol.ReplyError:
 		code, msg := protocol.ParseErrorCode(reply.ErrText)
@@ -175,6 +198,21 @@ func (c *Controller) stateFromValues(vals []float64) map[string]float64 {
 	}
 	for i := 0; i < n; i++ {
 		out[c.order[i]] = vals[i]
+	}
+	return out
+}
+
+// mergeState 用新算出的关节角覆盖"上一次状态"，缺的项沿用旧值。
+//
+// 与 `stateFromValues` 是同一件事，只是输入是 map 而不是数组 —— 设备侧上报
+// 只有**有舵机的关节**才会出现在 map 里（`ServoAnglesToJoints` 跳过被动关节）。
+// 不补全的话，缺项会被前端按限位下界补齐，界面上一闪就是一个假位姿。
+//
+// ⚠️ 只读 `c.lastState`、不写：写入统一走 `publishState`，避免两个写入口。
+func (c *Controller) mergeState(next map[string]float64) map[string]float64 {
+	out := copyJoints(c.lastState)
+	for k, v := range next {
+		out[k] = v
 	}
 	return out
 }
@@ -209,6 +247,42 @@ func (c *Controller) Apply(joints map[string]float64) error {
 	}
 
 	return c.dispatch(full)
+}
+
+// RawLine 把一行**原始设备指令**直通给链路末端（调试 / 验收用）。
+//
+// ⚠️ 它**不做限位校验**，也**不参与 ACK 门控** —— 语义上等同于"有人把线直接
+//    接在设备上敲了一条命令"，那条路径本来就不受上位机管辖。所以它不该被用来
+//    下发关节级命令（那要用 `Apply`）。
+//
+// 典型用途：`JOY <id> <raw>` / `SET <id> <ang>` —— 在仿真里复现"下位机被外部
+// 手段改动"，从而验证 `# SERVO` → `origin=device` → 界面跟随这条链路，
+// **不必真的去拨硬件摇杆**。
+//
+// 回执照常经 `Lines()` 走 `handleLine`：`JOY` 触发的 `# SERVO` 会被解析成
+// `ReplyServo` 并发布为 `OriginDevice` 状态 —— 那条路不需要任何特判。
+func (c *Controller) RawLine(line string) error {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return fmt.Errorf("控制器已关闭")
+	}
+	if strings.TrimSpace(line) == "" {
+		return fmt.Errorf("空指令")
+	}
+	if !c.dev.Connected() {
+		reason := c.dev.UnavailableReason()
+		if reason == "" {
+			reason = "链路不可用"
+		}
+		return &RejectError{Code: protocol.CodeDeviceDown, Message: reason}
+	}
+	log.Printf("[ctl] 调试直通 → 设备: %q", line)
+	if err := c.dev.WriteLine(line); err != nil {
+		return &RejectError{Code: protocol.CodeDeviceDown, Message: err.Error()}
+	}
+	return nil
 }
 
 // RejectError 表示命令被**同步拒绝**（浏览器会立刻收到 error 消息）。
@@ -383,7 +457,7 @@ func (c *Controller) drainPending() {
 // 状态与订阅
 // ---------------------------------------------------------------------------
 
-func (c *Controller) publishState(joints map[string]float64) {
+func (c *Controller) publishState(joints map[string]float64, origin string) {
 	c.mu.Lock()
 	c.lastState = copyJoints(joints)
 	hs := append([]JointStateHandler(nil), c.stateH...)
@@ -391,7 +465,7 @@ func (c *Controller) publishState(joints map[string]float64) {
 	at := c.nowFn()
 	for _, h := range hs {
 		if h != nil {
-			h(joints, at)
+			h(joints, at, origin)
 		}
 	}
 }

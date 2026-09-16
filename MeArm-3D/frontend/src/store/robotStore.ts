@@ -36,6 +36,7 @@ import {
   homeJointState,
   jointByRole,
   jointIds,
+  jointStatesEqual,
   loadRobot,
   loadRobotModel,
   movableJoints,
@@ -233,6 +234,17 @@ interface RobotStore {
    * 重连走的是既有的"补发当前命令"路径（那时用户已经有意图了，不能反过来被覆盖）。
    */
   attachToActual(next: JointState): void;
+  /**
+   * 让本地命令侧**跟随设备的自主变化**（硬件摇杆 / 红外遥控 / 面板手拧）。
+   *
+   * 与 `attachToActual` 的区别只在时机：那个是**首次连接的一次性握手**
+   * （当时本地还没有任何命令），本动作是**稳态**下的持续跟随。
+   *
+   * ⚠️ 调用方必须**抑制下发**（`transportBridge` 用 `suppressCommandSend`）：
+   * 写 `commandJoints` 会触发"命令变化 → 下发"的订阅，那等于把设备刚做的
+   * 动作推回去 —— 正是 spec §十九 要防的 `命令 → 状态 → 命令` 回环。
+   */
+  followDevice(next: JointState): void;
   goHome(): void;
   goZero(): void;
   /** 求解末端目标并驱动关节；返回 IK 原始结果供调用方分支 */
@@ -574,13 +586,38 @@ export const useRobotStore = create<RobotStore>((set, get) => {
       );
     },
 
+    followDevice(next) {
+      const m = get().model;
+      const clipped = clipJointState(m, next);
+
+      // ⚠️ 值没变就不写：设备只在移动时上报，静止时不上报，
+      //    所以这一道主要是防"上报内容与当前完全一致"的重复帧
+      //    把 React 白白重渲染一遍。
+      //
+      // 容差 0.01° 比链路能表达的精度小一个量级（真机 0.347°、sim 0.1°），
+      // 因此**真正的变化一个都不会被吃掉**。
+      if (jointStatesEqual(get().commandJoints, clipped, 0.01)) return;
+
+      const pose = endEffectorPose(m, clipped);
+      set({
+        commandJoints: clipped,
+        endEffector: pose,
+        // 设备报的是**实际**位置，两侧同时写：外部驱动下"命令 = 现状"
+        actualJoints: clipped,
+        actualEndEffector: pose,
+        // 目标同步到设备现状 —— 否则幽灵标记停在旧位置，面板误报"还差多远"
+        target: [pose.position[0], pose.position[1], pose.position[2]],
+        ikStatus: null,
+        controlSource: 'real',
+      });
+    },
+
     goHome() {
       const m = get().model;
       const home = clipJointState(m, homeJointState(m));
       set(deriveVirtual(m, home, true, get().transportDriven));
       get().pushLog('sys', `HOME 位姿 ${JSON.stringify(home)}`);
     },
-
     goZero() {
       // 关节空间原点：各关节 0°。小臂（绝对角）的真机可达区间是 108.44..141.86°，
       // 0° 不可达，故 clipJointState 会把它钳到最竖直的可达角 —— 结果是真机约束，不是 bug。

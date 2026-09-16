@@ -22,6 +22,11 @@ extern "C" {
 
 #define SLOW_MS    30   /* arm_tick + joystick cadence */
 #define LED_MS   500    /* heartbeat period */
+/* 设备侧自主变化（摇杆 / 红外）的上报周期。
+   ★ 刻意**低于** arm_tick 的 33 Hz：遥测只需要让人眼看得出"界面在跟着走"，
+   没必要把每一小步都送出去。真正的优先级由 arm_report_tick() 内部的
+   "TX 环为空才发"保证（见 core/arm_control.c）。 */
+#define REPORT_MS 60
 
 int main(void) {
     uart_init(115200);        /* COM4 @ 115200 8N1, bidirectional */
@@ -37,8 +42,9 @@ int main(void) {
     uart_puts(PSTR("        type HELP for commands\r\n"));
     arm_status();
 
-    uint32_t last_slow = 0;
-    uint32_t last_led  = 0;
+    uint32_t last_slow   = 0;
+    uint32_t last_led    = 0;
+    uint32_t last_report = 0;
     for (;;) {
         /* fast path: never blocks, so IR/serial/sequence events are handled
            with minimal latency */
@@ -51,6 +57,13 @@ int main(void) {
             last_slow = now;
             arm_tick();      /* ramp / auto-sweep */
             joystick_scan(); /* hardware joystick -> arm_nudge (if enabled) */
+        }
+        /* ★ 设备侧自主变化的上报（摇杆 / 红外）：必须在 cmd_poll() 之后 ——
+           顺序本身就是优先级。命令先受理并应答，遥测只能捡 TX 空闲的时机
+           （arm_report_tick 会自行检查 TX 环是否为空）。 */
+        if (now - last_report >= REPORT_MS) {
+            last_report = now;
+            arm_report_tick();
         }
         if (now - last_led >= LED_MS) {
             last_led = now;

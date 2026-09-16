@@ -274,3 +274,151 @@ func TestSimCloseIsIdempotent(t *testing.T) {
 		t.Error("Close 后 WriteLine 应报错，而不是静默丢弃")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 设备侧外部入口（SET / S<n>= / JOY）与两条上报路径
+// ---------------------------------------------------------------------------
+
+// poll 轮询直到条件满足或超时。
+func poll(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+// 固件级外部入口（这里用简写 `S7=120`）必须让 sim 走**异步上报**路径：
+// 位置推进时发 `# SERVO …`（舵机角），而不是 `STATE …`（关节角）。
+//
+// 两条路径的分工见 sim.go 文件头：`# SERVO` 代表"设备侧外部变化"，
+// 后端据此把状态标成 OriginDevice，界面才会跟着走。
+func TestSimExternalEntryReportsServoAsync(t *testing.T) {
+	d := newSim(t, DefaultSimTuning())
+	if err := d.WriteLine("S7=120"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+	got := waitContains(d, "# SERVO", 500*time.Millisecond)
+	if got == "" {
+		t.Fatal("S7=120 之后应出现 `# SERVO` 异步上报（外部变化走这条路径）")
+	}
+	if !strings.HasPrefix(got, "# SERVO") {
+		t.Errorf("上报行 = %q, 期望以 `# SERVO` 开头", got)
+	}
+	// 值与目标一致（tick 会推进到 120）
+	if !poll(time.Second, func() bool { return math.Abs(d.snapshot()[7]-120) < 1e-6 }) {
+		t.Errorf("S7 未收敛到 120，实际 %.2f", d.snapshot()[7])
+	}
+}
+
+// JR 通路必须仍然是 `STATE` —— 命令引起的状态不能被 `# SERVO` 顶替，
+// 否则界面会把命令侧一路拖向实际位置（拖滑杆时滑杆被回拉）。
+func TestSimJRPathStillUsesState(t *testing.T) {
+	tune := DefaultSimTuning()
+	tune.MaxServoSpeed = 60
+	tune.TickMs = 40
+	tune.LatencyMs = 0
+	d := newSim(t, tune)
+	if err := d.WriteLine("JR 0 20.8 112.62 50"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+	got := waitContains(d, "STATE", 500*time.Millisecond)
+	if got == "" {
+		t.Fatal("JR 之后应回 STATE")
+	}
+	if strings.HasPrefix(got, "# SERVO") {
+		t.Errorf("命令通路不该用 `# SERVO` 上报: %q", got)
+	}
+}
+
+func TestSimRejectsUnknownServoShorthand(t *testing.T) {
+	d := newSim(t, DefaultSimTuning())
+	// S5 不在固件的 6..9 里 —— 简写正则都不该匹配，应落到 ERR UNKNOWN
+	if err := d.WriteLine("S5=120"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+	if got := waitContains(d, "ERR", 300*time.Millisecond); got == "" {
+		t.Error("未知通道应回 ERR，而不是静默不动")
+	}
+}
+
+// `SET` 的舵机角必须被**硬限位钳位**并如实回执 —— 与固件 arm_set_angle() 同语义。
+func TestSimSetClampsToServoLimits(t *testing.T) {
+	d := newSim(t, DefaultSimTuning())
+	// 250° 远超任何舵机行程；固件会钳位而不是报错
+	if err := d.WriteLine("SET 7 250"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+	if !poll(time.Second, func() bool { return d.snapshot()[7] > 120 }) {
+		t.Errorf("S7 未被驱动（%.2f）", d.snapshot()[7])
+	}
+	// 钳位后的值必须落在 HOME(90) 与上限之间，绝不是 250
+	if got := d.snapshot()[7]; got > 200 {
+		t.Errorf("S7 = %.2f —— 未被钳位（固件 arm_set_angle 是钳位语义）", got)
+	}
+}
+
+// JOY 的方向与步长必须与固件 core/joystick.c 的 joystick_delta() 一致 ——
+// 两处各写一份而不能对照，是"仿真验收数字与真机对不上"的经典来源。
+func TestSimJoystickMatchesFirmwareFormula(t *testing.T) {
+	d := newSim(t, DefaultSimTuning())
+	// raw = 1023（推到底）⇒ step = 2 + 223/30 = 9；id=7 非反向 ⇒ -9
+	if err := d.WriteLine("JOY 7 1023"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+	if !poll(time.Second, func() bool { return math.Abs(d.snapshot()[7]-81) < 1e-6 }) {
+		t.Errorf("S7 = %.2f, 期望 81（90 − 9）—— 与固件公式不一致", d.snapshot()[7])
+	}
+
+	// 死区内不动
+	d2 := newSim(t, DefaultSimTuning())
+	if err := d2.WriteLine("JOY 7 500"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if got := d2.snapshot()[7]; math.Abs(got-90) > 1e-6 {
+		t.Errorf("死区（raw=500）不该动，S7 = %.2f", got)
+	}
+}
+
+// ★ 低优先级：命令在途期间，外部上报**不许抢在命令应答前面**。
+//
+// 这是"这个触发优先级低于正常通讯的交互指令"在 sim 侧的落点。
+// 若抢跑：真机上遥测帧会与命令应答争 TX 空间，拖动时命令越来越晚 (饿死)；
+// 仿真里则表现为回执顺序错乱，把"哪行属于哪条命令"的判断带偏。
+func TestSimExternalReportYieldsToInflightJR(t *testing.T) {
+	tune := DefaultSimTuning()
+	tune.LatencyMs = 200 // 制造一个 200ms 的"命令在途"窗口
+	d := newSim(t, tune)
+
+	if err := d.WriteLine("JR 0 20.8 112.62 50"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+	// 在途期间从外部拨动（若不抑制，这一拨的 `# SERVO` 会插在 OK JR 之前）
+	time.Sleep(30 * time.Millisecond)
+	if err := d.WriteLine("JOY 7 1023"); err != nil {
+		t.Fatalf("WriteLine 报错: %v", err)
+	}
+
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		line := next(d, time.Until(deadline))
+		if line == "" {
+			break
+		}
+		if strings.HasPrefix(line, "OK JR") {
+			break // 命令应答先到 ✓
+		}
+		if strings.HasPrefix(line, "# SERVO") {
+			t.Fatalf("外部上报抢在命令应答之前: %q", line)
+		}
+	}
+
+	// 让位 ≠ 丢弃：命令了结后必须补报，否则界面永远停在旧姿态
+	if got := waitContains(d, "# SERVO", 800*time.Millisecond); got == "" {
+		t.Error("被让位的外部上报必须在命令了结后补报出来")
+	}
+}

@@ -322,6 +322,93 @@ describe('WebSocket 接线 · 重连补发', () => {
   });
 });
 
+describe('WebSocket 接线 · 设备侧自主变化（origin=device）', () => {
+  /** 先消费掉首次接管握手，此后才是稳态 */
+  async function steady(): Promise<Harness> {
+    const h = await connected();
+    h.factory.last.deliver({ version: 1, type: 'joint_state', joints: { ...home } });
+    return h;
+  }
+
+  it('★ 摇杆改动下位机 ⇒ 命令侧跟随（滑杆 / 主臂不再停在旧值）', async () => {
+    const h = await steady();
+    const before = useRobotStore.getState().commandJoints;
+    const nudged = { ...home, shoulder: 42, elbow: 130 };
+
+    h.factory.last.deliver({
+      version: 1,
+      type: 'joint_state',
+      joints: nudged,
+      origin: 'device',
+    });
+
+    const s = useRobotStore.getState();
+    expect(s.commandJoints).not.toBe(before); // 确实改写了命令侧（这正是跟随）
+    expect(s.commandJoints.shoulder).toBeCloseTo(42, 9);
+    expect(s.commandJoints.elbow).toBeCloseTo(130, 9);
+    // 外部驱动下"命令 = 现状"，两侧同步
+    expect(s.actualJoints.shoulder).toBeCloseTo(42, 9);
+    expect(s.controlSource).toBe('real');
+
+    // 目标同步到设备现状，否则把手停在旧位置、面板误报"还差多远"
+    const tcp = endEffectorPose(model, s.commandJoints).position;
+    expect(s.target[0]).toBeCloseTo(tcp[0], 9);
+    expect(s.target[2]).toBeCloseTo(tcp[2], 9);
+  });
+
+  it('★ 跟随**绝不**回发命令（无 设备 → 上位机 → 设备 的对抗）', async () => {
+    const h = await steady();
+    for (let i = 1; i <= 20; i += 1) {
+      h.factory.last.deliver({
+        version: 1,
+        type: 'joint_state',
+        joints: { ...home, shoulder: 10 + i },
+        origin: 'device',
+      });
+    }
+    h.timer.advance(500); // 足够放掉任何 trailing
+    // 若不抑制下发，每次摇杆上报都会把设备刚做的动作推回去
+    expect(h.frames('joint_command')).toHaveLength(0);
+  });
+
+  it('缺省 origin（命令回执）**不**跟随 —— 引用级不变', async () => {
+    const h = await steady();
+    const before = useRobotStore.getState().commandJoints;
+    h.factory.last.deliver({
+      version: 1,
+      type: 'joint_state',
+      joints: { ...home, shoulder: 33 },
+    });
+    const s = useRobotStore.getState();
+    expect(s.commandJoints).toBe(before); // toBe：引用级
+    expect(s.actualJoints.shoulder).toBeCloseTo(33, 9);
+  });
+
+  it('未知 origin 取值按命令处理（宁可少跟随，也不误判方向）', async () => {
+    const h = await steady();
+    const before = useRobotStore.getState().commandJoints;
+    h.factory.last.deliver({
+      version: 1,
+      type: 'joint_state',
+      joints: { ...home, shoulder: 33 },
+      origin: 'DEVICE', // 大小写不同：不当成 device
+    });
+    expect(useRobotStore.getState().commandJoints).toBe(before);
+  });
+
+  it('值没变（差 < 0.01°）时不动引用，避免无谓重渲染', async () => {
+    const h = await steady();
+    const before = useRobotStore.getState().commandJoints;
+    h.factory.last.deliver({
+      version: 1,
+      type: 'joint_state',
+      joints: { ...before },
+      origin: 'device',
+    });
+    expect(useRobotStore.getState().commandJoints).toBe(before);
+  });
+});
+
 describe('WebSocket 接线 · 状态面板', () => {
   it('hello 后统计里带上 device 与模型一致性结论', async () => {
     const h = await connected();

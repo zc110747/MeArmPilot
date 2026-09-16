@@ -107,11 +107,12 @@ func loadModel(t *testing.T) *robot.Model {
 }
 
 type harness struct {
-	ctl *Controller
-	dev *fakeDevice
-	mu  sync.Mutex
-	st  map[string]float64
-	err []string
+	ctl    *Controller
+	dev    *fakeDevice
+	mu     sync.Mutex
+	st     map[string]float64
+	origin string
+	err    []string
 }
 
 func newHarness(t *testing.T, cfg Config) *harness {
@@ -120,9 +121,10 @@ func newHarness(t *testing.T, cfg Config) *harness {
 	dev := newFakeDevice()
 	ctl := New(m, dev, cfg)
 	h := &harness{ctl: ctl, dev: dev}
-	ctl.OnJointState(func(j map[string]float64, _ time.Time) {
+	ctl.OnJointState(func(j map[string]float64, _ time.Time, origin string) {
 		h.mu.Lock()
 		h.st = j
+		h.origin = origin
 		h.mu.Unlock()
 	})
 	ctl.OnError(func(code, msg string) {
@@ -139,6 +141,13 @@ func (h *harness) state() map[string]float64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.st
+}
+
+// stateOrigin 最近一帧状态的来源（`protocol.OriginCommand` / `OriginDevice`）。
+func (h *harness) stateOrigin() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.origin
 }
 
 func (h *harness) errors() []string {
@@ -233,6 +242,93 @@ func TestStatePublishesJoints(t *testing.T) {
 	st := h.state()
 	if math.Abs(st["shoulder"]-20.8) > 1e-9 || math.Abs(st["elbow"]-120) > 1e-9 {
 		t.Errorf("状态解析错误: %v", st)
+	}
+	// STATE 是**命令引起**的状态：前端据此只更新 Actual，不跟随命令侧
+	if got := h.stateOrigin(); got != protocol.OriginCommand {
+		t.Errorf("STATE 的来源 = %q, 期望 %q", got, protocol.OriginCommand)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 设备侧自主变化（摇杆 / 红外 / 手拧）
+// ---------------------------------------------------------------------------
+
+// findActuator 取某通道的执行器（真值表来自 robot.yaml，不在这里写死标定）。
+func findActuator(t *testing.T, m *robot.Model, ch int) *robot.Actuator {
+	t.Helper()
+	for i := range m.Actuators {
+		if m.Actuators[i].Channel == ch {
+			return &m.Actuators[i]
+		}
+	}
+	t.Fatalf("robot.yaml 里没有通道 S%d 的执行器", ch)
+	return nil
+}
+
+// 设备侧自主变化必须以 `# SERVO` 上报，并标成 **OriginDevice**。
+//
+// 这是"摇杆把机械臂拧了 30°、上位机界面跟不跟"这条需求的入口。
+// 标错来源的两种后果都很隐蔽：
+//   - 标成 OriginCommand ⇒ 界面不跟随，滑杆停在旧位置（用户看到的界面在说假话）
+//   - 由前端自己猜（比较 Actual 与 Command）⇒ 拖动时设备还在斜坡上，
+//     前端会把命令侧一路拉回半路位置（回环）
+func TestDeviceServoReportPublishesDeviceOrigin(t *testing.T) {
+	h := newHarness(t, DefaultConfig())
+	m := loadModel(t)
+
+	// 四个舵机停在 HOME，唯独把 S7（肩）拧到 120° —— 模拟"有人动了摇杆"
+	servo := map[int]float64{}
+	for _, id := range m.JointOrder() {
+		for _, a := range m.ActuatorsForJoint(id) {
+			servo[a.Channel] = robot.JointToServo(a, m.HomePose[id])
+		}
+	}
+	servo[7] = 120
+	h.dev.emit(protocol.EncodeServoReport(servo))
+
+	if !wait(t, time.Second, func() bool { return h.state() != nil }) {
+		t.Fatal("设备上报应收敛为 joint_state 事件")
+	}
+	if got := h.stateOrigin(); got != protocol.OriginDevice {
+		t.Errorf("来源 = %q, 期望 %q（否则界面不会跟随）", got, protocol.OriginDevice)
+	}
+	// ★ 关节角必须由**后端唯一一处**用标定表反算 —— 设备不认识关节，
+	//   它报的永远是舵机角。这里用真值表算出的期望值来证明换算真的发生了。
+	shoulder := findActuator(t, m, 7)
+	want := robot.ServoToJoint(shoulder, 120)
+	if got := h.state()[shoulder.JointID]; math.Abs(got-want) > 1e-9 {
+		t.Errorf("反算关节角 = %.6f, 期望 %.6f（标定未被应用？）", got, want)
+	}
+	// 未参与的关节必须**沿用上一次状态**，不能被补齐成限位下界
+	if got := h.state()["base"]; got != m.HomePose["base"] {
+		t.Errorf("未上报的关节 = %v, 期望沿用旧值 %v", got, m.HomePose["base"])
+	}
+}
+
+// `# SERVO` 是**异步事件**，不是某条在途命令的应答 ⇒ 不得放行 ACK 门控。
+//
+// 若误当应答处理：拖动时每来一行摇杆上报就放行一次门控，命令下发频率
+// 会被上报频率带飞（真机上就是把自己打爆）。
+func TestDeviceServoReportDoesNotFinishInflight(t *testing.T) {
+	h := newHarness(t, DefaultConfig())
+	if err := h.ctl.Apply(map[string]float64{"shoulder": 20.8}); err != nil {
+		t.Fatalf("Apply 失败: %v", err)
+	}
+	if !wait(t, time.Second, func() bool { return h.dev.count() == 1 }) {
+		t.Fatalf("应写设备 1 条，实际 %v", h.dev.lines_())
+	}
+
+	// 在途期间来一行设备上报
+	h.dev.emit(protocol.EncodeServoReport(map[int]float64{7: 120}))
+	time.Sleep(60 * time.Millisecond)
+
+	// 再下一条命令：门控**仍未**放行 ⇒ 只应进待发槽，不写设备
+	if err := h.ctl.Apply(map[string]float64{"shoulder": 30}); err != nil {
+		t.Fatalf("Apply 失败: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if n := h.dev.count(); n != 1 {
+		t.Errorf("异步上报不该放行门控，设备却被写了 %d 条: %v", n, h.dev.lines_())
 	}
 }
 

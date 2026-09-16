@@ -64,6 +64,15 @@ uint8_t uart_rx_drop_count(void) { return rx_drop; }
 uint8_t uart_tx_drop_count(void) { return tx_drop; }
 void uart_clear_drop_counters(void) { rx_drop = 0; tx_drop = 0; }
 
+/* 见 uart.h：给"低优先级上报"用的水位查询。
+   ★ 实现要点：tx_head / tx_tail 都是 uint8_t，环长 256 ⇒ 相减天然回绕，
+   不需要 16 位取模运算（在 8 位机上那是非原子的读改写窗口）。
+   若哪天把 TX_BUF_SZ 改成非 256，这里必须跟着改 —— 因此保留 % 表达式，
+   让编译器按常量约简，改大小也不会静默算错。 */
+uint8_t uart_tx_used(void) {
+    return (uint8_t)((uint8_t)(tx_head - tx_tail) % TX_BUF_SZ);
+}
+
 void uart_init(uint32_t baud) {
     /* reset heads/tails */
     rx_head = rx_tail = 0;

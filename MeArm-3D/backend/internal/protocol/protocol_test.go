@@ -103,11 +103,74 @@ func TestParseReplyState(t *testing.T) {
 }
 
 func TestParseReplyOther(t *testing.T) {
-	for _, line := range []string{"# IR RAW=...", "OK SET S9=120", "", "  ", "PONG", "OK JOY S6=89 S7=89"} {
+	for _, line := range []string{
+		"# IR RAW=...", "", "  ", "PONG",
+		// ⚠️ 下面三行**含** `S<n>=` 或 `S<n>`，但都不是"设备侧实际位置"：
+		//
+		//	OK SET S9=120    ⇒ arm_set_angle() 返回的**钳位后目标角**，不是实际位置。
+		//	                   若把它当 Actual 收下，就会出现"状态永远等于命令、
+		//	                   误差恒为 0" —— 一个乐观 ACK 抹掉整条收敛语义。
+		//	OK JOY S6=89 …   ⇒ 固件的摇杆应答；实际位置另有 `# SERVO` 上报，
+		//	                   不靠应答（应答里的角也可能被后续斜坡改掉）。
+		//	OK STOP S9 (hold 90) ⇒ 括号里的数字连 `=` 都没有，只是确认文本。
+		"OK SET S9=120",
+		"OK JOY S6=89 S7=89",
+		"OK STOP S9 (hold 90)",
+		"OK AUTO S9",
+	} {
 		r := ParseReply(line)
 		if r.Kind != ReplyOther {
 			t.Errorf("行 %q 应判为 OTHER, 却得到 %v", line, r.Kind)
 		}
+	}
+}
+
+// `# SERVO …` / `STATUS …` 携带的是设备侧**实际**舵机角 → ReplyServo。
+//
+// 与 ReplyOKJR（目标角）的区别是整个特性的关键：命令应答说"我要去哪"，
+// 本行说"现在在哪"。两者都不能被对方吞掉。
+func TestParseReplyServo(t *testing.T) {
+	cases := []string{
+		"# SERVO S9=90.00 S8=90.00 S7=120.00 S6=90.00",
+		"STATUS S9=90 S7=120 S8=90 S6=90",
+	}
+	for _, line := range cases {
+		r := ParseReply(line)
+		if r.Kind != ReplyServo {
+			t.Errorf("行 %q 应判为 SERVO, 得到 %v", line, r.Kind)
+			continue
+		}
+		if r.ServoAngles[7] != 120 {
+			t.Errorf("行 %q 的 S7 = %v, 期望 120", line, r.ServoAngles[7])
+		}
+	}
+}
+
+func TestParseReplyServoKeepsOKJRPriority(t *testing.T) {
+	// `OK JR` 同样含 `S<n>=`，必须先被判成 ReplyOKJR（目标角）
+	r := ParseReply("OK JR S9=90.00 S7=120.00 S8=90.00 S6=90.00")
+	if r.Kind != ReplyOKJR {
+		t.Fatalf("Kind = %v, 期望 OK_JR（否则目标角会被当成实际位置）", r.Kind)
+	}
+	// ERR 优先于一切
+	if r := ParseReply("ERR SERVO S9 120.00 (limit 30.00..150.00)"); r.Kind != ReplyError {
+		t.Errorf("Kind = %v, 期望 ERR", r.Kind)
+	}
+}
+
+func TestEncodeServoReport(t *testing.T) {
+	got := EncodeServoReport(map[int]float64{9: 90, 7: 119.5, 8: 72.33, 6: 90})
+	want := "# SERVO S9=90.00 S8=72.33 S7=119.50 S6=90.00"
+	if got != want {
+		t.Errorf("EncodeServoReport = %q, 期望 %q", got, want)
+	}
+	// 往返：编出来的行必须能被解回同一组舵机角（否则真机上就是"发得出去、界面不动"）
+	r := ParseReply(got)
+	if r.Kind != ReplyServo {
+		t.Fatalf("自编行被判成 %v —— 编码与解析不一致", r.Kind)
+	}
+	if r.ServoAngles[7] != 119.5 || r.ServoAngles[8] != 72.33 {
+		t.Errorf("往返后舵机角 = %v", r.ServoAngles)
 	}
 }
 

@@ -99,12 +99,34 @@ export function quantizeViaServo(model: RobotModel, joints: JointState): JointSt
 export const CLIENT_JOINT_COMMAND = 'joint_command';
 export const CLIENT_PING = 'ping';
 export const CLIENT_STATUS_REQUEST = 'status_request';
+/**
+ * 调试直通：把一行**原始设备指令**（`JOY …` / `SET …`）发给链路末端。
+ *
+ * 用途是让"下位机被外部手段改动 → 界面跟随"这条链路**在仿真里就能验证**
+ * （真机上对应硬件摇杆 / 红外遥控，仿真里对应这两条固件级命令）。
+ *
+ * ⚠️ 它绕过关节限位校验（固件按舵机硬限位自钳），只应被调试脚本 / 验收探针
+ *    使用，**不要**接到用户界面上。
+ */
+export const CLIENT_DEVICE_COMMAND = 'device_command';
 
 export const SERVER_HELLO = 'hello';
 export const SERVER_JOINT_STATE = 'joint_state';
 export const SERVER_ERROR = 'error';
 export const SERVER_PONG = 'pong';
 export const SERVER_DEVICE_STATUS = 'device_status';
+
+/**
+ * 关节状态的来源（字面量与后端 `protocol.OriginCommand` / `OriginDevice` 一致）。
+ *
+ * `device` 表示设备侧**自主变化**（硬件摇杆 / 红外遥控 / 面板手拧 / 调试直控）——
+ * 界面必须让命令侧跟随，否则滑杆、主臂、目标点会停在旧值上，
+ * 而画面上看不出任何异常。
+ *
+ * ⚠️ 缺省（字段不存在）按 `command` 处理：老后端不发它，行为与引入前一致。
+ */
+export const ORIGIN_COMMAND = 'command';
+export const ORIGIN_DEVICE = 'device';
 
 export const CODE_BAD_MESSAGE = 'BAD_MESSAGE';
 export const CODE_VERSION = 'VERSION_MISMATCH';
@@ -160,6 +182,8 @@ export interface ServerEnvelope {
   model?: BackendModelInfo;
   device?: string;
   connected?: boolean;
+  /** 关节状态来源（`ORIGIN_COMMAND` / `ORIGIN_DEVICE`）；缺省按 command 处理 */
+  origin?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +216,21 @@ export function encodePing(timestamp: number = Date.now()): string {
 
 export function encodeStatusRequest(timestamp: number = Date.now()): string {
   return JSON.stringify({ version: PROTOCOL_VERSION, type: CLIENT_STATUS_REQUEST, timestamp });
+}
+
+/**
+ * 编码一条**调试直通**指令（`JOY <id> <raw>` / `SET <id> <ang>`）。
+ *
+ * 见 `CLIENT_DEVICE_COMMAND`：它让仿真也能复现"摇杆把机械臂拧了 30°"，
+ * 从而验证界面是否跟随 —— 否则这条链路只能靠手动拨硬件来验。
+ */
+export function encodeDeviceCommand(line: string, timestamp: number = Date.now()): string {
+  return JSON.stringify({
+    version: PROTOCOL_VERSION,
+    type: CLIENT_DEVICE_COMMAND,
+    timestamp,
+    line,
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -152,6 +152,13 @@ export class TransportBridge {
   private suppressCommandSend = false;
   /** 被安全门拦下的下发次数（mode=simulation 却连着真机链路） */
   private blockedSince = 0;
+  /**
+   * 是否已就"设备侧自主变化"记过日志。
+   *
+   * 摇杆持续拨动时每帧都会走 `followDevice`，逐帧记日志会把面板刷满；
+   * 而"为什么要跟随"这个信息只需要出现一次。连接复位时清回 false。
+   */
+  private deviceOriginLogged = false;
 
   constructor(options: TransportBridgeOptions = {}) {
     this.timer = options.timer ?? realTimer;
@@ -246,6 +253,7 @@ export class TransportBridge {
     this.commandAuthoredSinceConnect = false;
     this.suppressCommandSend = false;
     this.blockedSince = 0;
+    this.deviceOriginLogged = false;
 
     // ⚠️ 这里必须**显式**复位，不能指望 transport.disconnect() 发出的 disconnected 事件：
     //    上面已经退订了 status 监听，事件根本没人接。早先的写法就是踩了这个坑 ——
@@ -323,7 +331,10 @@ export class TransportBridge {
    * 回推落地。
    *
    * 稳态：**只写 `actualJoints`** —— 回写 command 即无限回环。
-   * 例外：**首次接管的第一帧**走 `attachToActual`（见字段 `attachPending` 注释）。
+   * 例外有二，都必须显式抑制下发：
+   *   ① **首次接管的第一帧**走 `attachToActual`（见字段 `attachPending` 注释）；
+   *   ② 后端标注 `origin === 'device'` 的帧走 `followDevice`
+   *      （设备侧自主变化，见 `handleState`）。
    */
   private handleState(state: RobotState): void {
     this.rxSince += 1;
@@ -343,7 +354,46 @@ export class TransportBridge {
         return;
       }
     }
+
+    // ★ 设备侧自主变化（硬件摇杆 / 红外遥控 / 面板手拧 / 调试直控）：
+    //   命令侧必须跟着走，否则滑杆、主臂、目标点停在旧值上 —— 而画面看起来
+    //   一切正常（这正是"上位机状态没跟随"这类缺陷最难被发现的地方）。
+    //
+    //   判据是**后端标注的 origin**，不是"比较 Actual 与 Command"：
+    //   拖动时设备还在斜坡上，Actual 必然落后于 Command，那种判据会把命令侧
+    //   一路拉回半路位置（spec §十九 明令禁止的回环）。
+    if (state.origin === 'device') {
+      this.followDevice(state);
+      return;
+    }
+
     store.setActualJoints(state.joints);
+  }
+
+  /**
+   * 把命令侧对齐到设备报来的现状（外部驱动）。
+   *
+   * ⚠️ 必须抑制下发：对齐会写 `commandJoints`，而上面那条 store 订阅把
+   * "命令变化"一律当作用户意图。不抑制的话，每次摇杆上报都会触发一条命令下发 ——
+   * 那既是 `命令 → 状态 → 命令` 回环，真机侧还会表现为
+   * "设备自己动 → 上位机又把它推回去"的对抗。
+   */
+  private followDevice(state: RobotState): void {
+    this.suppressCommandSend = true;
+    try {
+      this.store().followDevice(state.joints);
+    } finally {
+      this.suppressCommandSend = false;
+    }
+    // 只记一次：摇杆持续拨动时每帧一行会把日志面板刷满，
+    // 而"为什么会跟随"这个信息只需要出现一次。
+    if (!this.deviceOriginLogged) {
+      this.deviceOriginLogged = true;
+      this.store().pushLog(
+        'in',
+        '设备侧自主变化（摇杆 / 红外 / 手拧）—— 命令侧已跟随，未回发命令',
+      );
+    }
   }
 
   private handleStatus(detail: TransportStatusDetail): void {
@@ -359,6 +409,7 @@ export class TransportBridge {
       case 'connected': {
         store.setConnection(this.transport.kind, 'connected', this.describeCurrent());
         this.commandAuthoredSinceConnect = false;
+        this.deviceOriginLogged = false;
         if (this.hasConnectedOnce) {
           // ⚠️ 只在**重连**时补发：断线期间用户可能已改过命令，
           //    不补发会让虚拟臂与实际臂永久错开而 UI 看不出异常。

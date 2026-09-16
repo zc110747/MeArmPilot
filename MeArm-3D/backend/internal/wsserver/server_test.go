@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http/httptest"
 	"path/filepath"
@@ -424,6 +425,65 @@ func TestBadMessage(t *testing.T) {
 	if m.Code != protocol.CodeBadMessage {
 		t.Errorf("错误码 = %q, 期望 %q", m.Code, protocol.CodeBadMessage)
 	}
+}
+
+// 设备侧自主变化（摇杆 / 红外 / 手拧）这条链的**端到端**验证：
+//
+//	device_command{"JOY 7 1023"} → sim 受理 → `# SERVO …` 异步上报
+//	  → controller 解析成 ReplyServo → 广播 **origin=device** 的 joint_state
+//
+// 为什么这条 e2e 必须存在：它是"下位机被外部手段改动 → 上位机界面跟随"在
+// **没有真机**时唯一可复现的入口。摇杆拨不了，就用调试直通把同一行指令塞进链路
+// 末端，走的是与固件完全相同的 `# SERVO` 回执路径。
+//
+// 这条测试还顺带钉住一个极易回归的约束：直通指令**不得**参与 ACK 门控。
+// `JOY` 只回 `OK JOY`，不会回 `OK`；若控制器把它当交互指令挂上在途状态，
+// 800ms 后必然超时报错。所以这里遇到任何 error 消息就直接判失败。
+func TestDeviceCommandPublishesDeviceOrigin(t *testing.T) {
+	f := newFixture(t, device.DefaultSimTuning())
+	c := dialWS(t, f.http.URL, "/ws/joint")
+	c.recvType(t, protocol.TypeHello, 2*time.Second)
+	home := c.recvType(t, protocol.TypeJointState, 2*time.Second).Joints["shoulder"]
+
+	body, _ := json.Marshal(protocol.ClientMessage{
+		Version: protocol.Version, Type: protocol.TypeDeviceCommand,
+		Timestamp: time.Now().UnixMilli(), Line: "JOY 7 1023",
+	})
+	c.send(t, string(body))
+
+	sawDeviceOrigin := false
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		raw := c.recv(t, time.Until(deadline))
+		var m protocol.ServerMessage
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("上行消息不是合法 JSON: %q", raw)
+		}
+		switch m.Type {
+		case protocol.TypeError:
+			t.Fatalf("直通指令不应产生错误（是否被卷进 ACK 门控？）: %s %s", m.Code, m.Message)
+		case protocol.TypeJointState:
+			if m.Origin != protocol.OriginDevice {
+				// 命令来源的状态帧不该出现在这条链上；出现了说明上报走错了通道
+				// （`STATE` 而非 `# SERVO`），界面会把命令侧拖向实际位置。
+				t.Errorf("joint_state 的 origin = %q, 期望 %q", m.Origin, protocol.OriginDevice)
+				continue
+			}
+			sawDeviceOrigin = true
+			v, ok := m.Joints["shoulder"]
+			if !ok {
+				t.Errorf("origin=device 的状态缺少 shoulder：%v", m.Joints)
+				continue
+			}
+			if math.Abs(v-home) > 0.5 {
+				return // 肩角已离开 HOME ⇒ 链路打通
+			}
+		}
+	}
+	if !sawDeviceOrigin {
+		t.Fatalf("未收到 origin=%q 的 joint_state", protocol.OriginDevice)
+	}
+	t.Errorf("收到 origin=%q 状态但肩角仍停在 HOME %.4f（未跟随）", protocol.OriginDevice, home)
 }
 
 // 多客户端：状态必须广播给所有人（数字孪生页面 + 观测页面同时在线）。
