@@ -20,13 +20,13 @@ extern "C" {
      - ir_seq_tick : every loop iteration (reacts to stop/switch immediately)
      - LED heart   : toggles every 500 ms                                   */
 
-#define SLOW_MS    30   /* arm_tick + joystick cadence */
+#define SLOW_MS  50   /* arm_tick + joystick cadence */
 #define LED_MS   500    /* heartbeat period */
 /* 设备侧自主变化（摇杆 / 红外）的上报周期。
    ★ 刻意**低于** arm_tick 的 33 Hz：遥测只需要让人眼看得出"界面在跟着走"，
    没必要把每一小步都送出去。真正的优先级由 arm_report_tick() 内部的
    "TX 环为空才发"保证（见 core/arm_control.c）。 */
-#define REPORT_MS 60
+#define REPORT_MS 100   /* arm_report_tick cadence */
 
 int main(void) {
     uart_init(115200);        /* COM4 @ 115200 8N1, bidirectional */

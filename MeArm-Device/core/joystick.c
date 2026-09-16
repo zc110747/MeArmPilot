@@ -43,7 +43,7 @@ int8_t joystick_delta(uint8_t id, int raw) {
 
     int beyond = past_hi ? (raw - 800) : (200 - raw);  /* 0..~223 / 0..200 */
     int step = 2 + beyond / 30;                          /* ~2..9 */
-    if (step > 10) step = 10;
+    if (step > 3) step = 3;
 
     /* direction: normal axes -> +1 when raw<200 ; left(8) inverted -> +1 when raw>800 */
     bool positive = (id == 8) ? past_hi : past_lo;
