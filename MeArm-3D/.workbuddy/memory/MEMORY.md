@@ -58,7 +58,9 @@
 `pytest -q` **214**（core/tests 31 · tests/sim 167 · tests/sim2sim 9 · robot-package 7）·
 `test_baseline_frozen` **11** · `validate --all` ✓ · 前端 tsc 0 / vitest **439** · `go test` **89** 个顶层用例 ·
 固件（AVR）FLASH **13104 B**（text 12966 + data 138）/ RAM **849 B**（.data 138 + .bss 711），零警告 ·
-`verify_device_follow.mjs` sim **23/23** · mujoco **22/22** · serial **23/23**（连跑 3 次稳定）。
+`verify_device_follow.mjs` sim **23/23** · mujoco **22/22** · serial **23/23**（连跑 3 次稳定）·
+sim2sim 三侧面 **≤8.04e-14 mm**（容差 1e-6 ⇒ 余量 **1.24e7**，跨批 7 seed / 272 组）·
+判据有效性（跨批 + 注入）方法见 skill `arm-mujoco-physics-sim` §11。
 
 - ★★ **证书型数字（测试计数 / 资源占用 / 残差）必须现跑现取，禁止照抄** ——
   改代码或改 README 之前**先跑一遍**。本轮实测撞到两例：旧文档写「tsc 0 error」实际报 2 条，
