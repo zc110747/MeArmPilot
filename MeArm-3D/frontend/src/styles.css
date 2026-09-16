@@ -406,6 +406,85 @@ select {
   border-color: #43262a;
 }
 
+/* ---- 末端目标「安全参数」区（只影响参数，不影响算法） ---- */
+
+.guard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+}
+
+.guard-toggle {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 2px 6px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+}
+
+.guard-toggle:hover {
+  border-color: var(--border);
+}
+
+.guard-body {
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #14181e;
+}
+
+.guard-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.guard-row:first-child {
+  margin-top: 0;
+}
+
+.guard-label {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  min-width: 62px;
+}
+
+.guard-unit {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.guard-row input[type='number'] {
+  width: 68px;
+}
+
+.guard-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  min-width: 62px;
+  cursor: pointer;
+}
+
+.guard-note {
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 3px;
+}
+
 /* ---- Phase 11：链路误差反馈面板 ---- */
 
 .error-panel .err-rows {

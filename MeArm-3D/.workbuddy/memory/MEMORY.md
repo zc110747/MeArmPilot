@@ -25,6 +25,22 @@
 - **多机器人**：`config/robots.yaml` 只放指针 → `RobotRegistry` 唯一分派表（**禁止 `if robot ==`**）；
   SO-ARM101 资产**逐字节原样、禁止改**。
 - **改真值后必重生成 MJCF/URDF**（皆为产物，`test_generated_mjcf_is_in_sync_with_config` 盯）。
+- ★ **`ik.ts` 的"禁止改动"有唯一豁免口**：新增**可选参数且缺省语义不变**（opt-in）。
+  范例：`IkOptions.reachMaxMm?`（球壳外径覆写）。判据：`undefined` ⇒ 逐位一致
+  （必须用 sim2sim「抽象层残差差 0.000e+0」证明），传值 ⇒ 只影响 `cosAlpha` 的臂展。
+  ⚠️ **要"参与计算"就必须改 `ik.ts`**：外层拦一道只能"拒绝更早"，不能"按新臂展求解"。
+- ★★ **同一个量只能有一套口径** —— 宁可**扩 `Core→包` 的边**（登记进
+  `corePackageBoundary.test.ts` 的 ALLOWED），也**不要为了"少 import"而自己重算真值**。
+  实例：`robotStore.wristDistance()` 自己算腕枢轴距离 `d`，把 `radial` 取成
+  `wrist.parentLink`（`tcp.joint='tool'` 的 parentLink 是 **`forearm_link` 80**，
+  不是 `tool_link` 40）⇒ 与 `ik.ts` 的 `toolOffset[0]=40` 口径不符，
+  同一点算出 **92.159 vs 111.542（差 19.4mm）且不报错**，
+  症状是"改小外径后本该可达的点被判越界"、且**内圈被误报为可达**。
+  ⇒ 现改为 `ikGeometry()` + `wristSagittal()` 转发。
+- ⚠️ **在测试 helper 里发现的口径坑，必须立刻回头 grep 生产代码有没有同款。**
+  （上面那个坑我上一轮先在测试 helper 里踩到并修了，却没查生产代码，于是它多活了一轮。）
+- ⚠️ **几何量极易算错的证据**：`ik.ts` 专门有 `requireConstantToolOffset()`
+  用**三个姿态交叉验证**那个偏移常量 —— 说明它本来就容易算错，更不该有第二处重算。
 
 ## 二、验收
 
@@ -55,6 +71,7 @@
 | 冻结/基线/黄金数据决策理由 | `docs/decisions.md` D55 / D71–D73 |
 | 多机器人统一验收 / 运行期切换 | ADR D77–D79 |
 | 首帧"重影" / 幽灵臂渲染（D74） | ADR **D74** · `core/tools/park_sim_pose.mjs` |
+| 末端目标「安全参数」（容差/内径/外径覆写 · 为何无限位调节 · 为何进 ik.ts） | **`docs/target-guard-analysis.md` §7** |
 | 未修的无关问题 F1–F9 | `docs/architecture/mearm-v1-followups.md` |
 
 ## 四、skill 分层约定（`~/.workbuddy/skills/`）

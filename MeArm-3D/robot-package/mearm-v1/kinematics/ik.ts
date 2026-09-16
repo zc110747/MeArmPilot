@@ -140,6 +140,33 @@ export interface IkOptions {
   seed?: JointState;
   /** 残差阈值（mm）；超出即视为实现缺陷而非目标不可达，默认 1e-9 */
   tolerance?: number;
+  /**
+   * 球壳**外径**覆写（mm）。缺省 `undefined` ⇒ 用 `ikGeometry()` 从杆长求导出的
+   * `reach[1]`（= `l1 + l2`，本机 160）—— **与原行为逐位一致**。
+   *
+   * ## 为什么这个口子必须开在 `ik.ts` 里面
+   *
+   * 球壳外径与外径内径不同：外径参与 `cosAlpha = (d² − l1² − l2²)/(2·l1·l2)`
+   * 的求解。若只在 `solveIk` 之外拦一道 `d > reachMaxMm`，那么用户把外径
+   * 设成 100mm 时，2R 仍按 160mm 的臂展算出的角度 —— 那是"另一台机器人"的
+   * 姿态，不是"缩到 100mm 臂展"的姿态。⇒ 必须真正替换掉求解用的外径。
+   *
+   * ## 为什么这个改动是安全的（不破坏 sim2sim / 既有验收）
+   *
+   * · 缺省 `undefined` ⇒ 下面的代码路径**一个字节都没变**，`reach[1]` 仍是
+   *   求导值 ⇒ 所有既有调用（sim2sim bridge / sim2real / 2000 组闭环验收）
+   *   逐位一致。
+   * · 传入值时，只要目标落在覆写外径**以内**（`d ≤ reachMaxMm`），
+   *   `cosAlpha` 与不覆写时**完全相同**（同一个公式、同一组 l1/l2/d），
+   *   只是 `clamp1` 多一次无操作的上界收窄 ⇒ 解与残差逐位相同。
+   * · 差异**只在判据边缘**：`d ∈ (reachMaxMm, 原 reachMax]` 由"可达"变为
+   *   `OUT_OF_WORKSPACE`。这正是"外径覆写参与计算"的字面含义。
+   *
+   * ⚠️ 覆写值不在此处校验（`ik.ts` 不认识"参数"这个概念）。合法性由调用方
+   * 保证：见 `frontend/src/robot/model/parameterOverrides.ts` 的
+   * `REACH_MAX_FLOOR_MM` / `REACH_MAX_CEILING_MM`。
+   */
+  reachMaxMm?: number;
 }
 
 export interface IkSuccess {
@@ -525,7 +552,11 @@ function limitViolation(joint: Joint, value: number): number {
  * 返回的候选**包含被限位否决的支**，便于 UI/调试展示「另一支差多少度」；
  * 调用方若只想拿可行解，过滤 `feasible === true` 即可。
  */
-export function solveIkCandidates(model: RobotModel, target: Vec3): {
+export function solveIkCandidates(
+  model: RobotModel,
+  target: Vec3,
+  reachMaxMm?: number,
+): {
   reason?: IkReason;
   candidates: IkCandidate[];
   azimuth: number;
@@ -551,7 +582,12 @@ export function solveIkCandidates(model: RobotModel, target: Vec3): {
   const { dr, dz } = wristSagittal(geometry, target);
   const d = Math.hypot(dr, dz);
 
-  const [reachMin, reachMax] = geometry.reach;
+  // ⚠️ 外径覆写（`opts.reachMaxMm`）：缺省时 `effectiveReachMax` **恒等于**求导外径
+  //    ⇒ 与原行为逐位一致。传入合法值（≤ 求导外径）时它替换掉求解判据的外径，
+  //    于是 2R 的 `cosAlpha` 按新臂展求解 —— 这是"外径覆写真正参与计算"的落点。
+  //    详见 `IkOptions.reachMaxMm` 的说明。
+  const reachMin = geometry.reach[0];
+  const reachMax = reachMaxMm ?? geometry.reach[1];
   if (d > reachMax + EPS_MM || d < reachMin - EPS_MM) {
     return {
       reason: 'OUT_OF_WORKSPACE',
@@ -632,10 +668,15 @@ export function solveIk(model: RobotModel, target: Vec3, opts: IkOptions = {}): 
   const shoulder = requireRoleJoint(model, 'shoulder');
   const elbow = requireRoleJoint(model, 'elbow');
 
-  const { candidates, reason, azimuth, azimuthIndeterminate } = solveIkCandidates(model, target);
+  const { candidates, reason, azimuth, azimuthIndeterminate } = solveIkCandidates(
+    model,
+    target,
+    opts.reachMaxMm,
+  );
 
   if (reason === 'OUT_OF_WORKSPACE') {
-    const [reachMin, reachMax] = geometry.reach;
+    const reachMin = geometry.reach[0];
+    const reachMax = opts.reachMaxMm ?? geometry.reach[1];
     const { dr, dz } = wristSagittal(geometry, target);
     const d = Math.hypot(dr, dz);
     return {
@@ -645,7 +686,8 @@ export function solveIk(model: RobotModel, target: Vec3, opts: IkOptions = {}): 
         `目标 ${fmt(target)} 超出工作空间：腕枢轴到肩枢轴的距离 ${d.toFixed(3)}mm，` +
         `可达范围 ${reachMin.toFixed(3)}..${reachMax.toFixed(3)}mm ` +
         `（L1=${geometry.l1.toFixed(3)} + L2=${geometry.l2.toFixed(3)}；` +
-        `已扣除腕→TCP 偏移 [${geometry.toolOffset[0].toFixed(3)}, ${geometry.toolOffset[1].toFixed(3)}]）`,
+        `已扣除腕→TCP 偏移 [${geometry.toolOffset[0].toFixed(3)}, ${geometry.toolOffset[1].toFixed(3)}]` +
+        (opts.reachMaxMm === undefined ? '）' : '；外径覆写生效中）'),
       candidates: [],
     };
   }

@@ -29,20 +29,27 @@
 import { create } from 'zustand';
 import {
   appendFrame,
+  DEFAULT_TARGET_GUARD_PARAMS,
   defaultRobotId,
   emptyTrack,
   endEffectorPose,
   homeJointState,
   jointByRole,
   jointIds,
+  JOINT_TOLERANCE_MAX_DEG,
   loadRobot,
   loadRobotModel,
   movableJoints,
+  normalizeTargetGuardParams,
+  reachMaxOverrideFor,
+  REACH_MIN_FLOOR_MM,
+  TargetGuardParamError,
   zeroJointState,
   type AppendFrameOptions,
   type DragPlaneMode,
   type JointState,
   type RobotModel,
+  type TargetGuardParams,
   type TeachTrack,
   type Transform,
   type TransportStats,
@@ -63,10 +70,17 @@ import {
 // 已登记的处置路径（Phase 6/7）：给 `IKResult` 加一个可选的 `diagnostics` 袋子，
 // 由包内适配器填充，Core 只透传不解释；届时这条 import 才能真正删掉。
 //
+// ★★ `ikGeometry` / `wristSagittal` 是**后来加的**，理由更强：安全参数的
+//    前置检查必须与 `solveIk` 用**同一个 `d`**。自己重算过一次，结果偏了
+//    19.4mm（见 `wristDistance()` 的注释）—— 这正是本项目「真值只有一份」
+//    铁律要防的事。宁可扩这条边，也不要第二个口径。
+//
 // 这条边**被一条测试盯着**：`frontend/tests/unit/corePackageBoundary.test.ts`
 // 会列出全部"Core → 包"的 import，白名单外的一律失败 —— 于是它不会悄悄繁殖。
 import {
+  ikGeometry,
   solveIk,
+  wristSagittal,
   type IkBranch,
   type IkPreference,
   type IkReason,
@@ -140,6 +154,20 @@ interface RobotStore {
   dragPlane: DragPlaneMode;
   /** 是否正在拖动末端（拖动期间需禁用轨道旋转，否则会边转相机边拖） */
   dragging: boolean;
+
+  /**
+   * 末端目标「安全参数」（运行期可调，**不是**配置真值）。
+   *
+   * 三项都**只影响参数、不影响算法**（见 `robot/model/parameterOverrides.ts`）：
+   *   · `jointToleranceDeg` 判据容差（默认 0 = 与引入前逐位一致）
+   *   · `reachMinOverridden` / `reachMinMm` 球壳内径覆写（默认不覆写）
+   *
+   * ⚠️ 默认值刻意全部退化为"无覆写" ⇒ 不配置时 `moveTo` 的行为与引入本特性前
+   *    逐位相同，Phase 6 的 13 条冻结断言（越界即拒绝、关节逐位不变）继续通过。
+   */
+  targetGuard: TargetGuardParams;
+  /** 末端目标参数被拒绝时的原因（null = 当前参数全部合法） */
+  targetGuardError: string | null;
 
   mode: RobotMode;
   controlSource: RobotControlSource;
@@ -216,6 +244,17 @@ interface RobotStore {
   setDragPlane(mode: DragPlaneMode): void;
   setDragging(value: boolean): void;
   /**
+   * 设置末端目标安全参数（部分更新）。
+   *
+   * ⚠️ 参数非法时**拒绝写入**并把原因放进 `targetGuardError`，绝不静默接受 ——
+   * 一个越界的容差会让"硬误差 ≤ 2%"这个承诺失效，而界面上看不出任何异常。
+   *
+   * @returns 是否被接受
+   */
+  setTargetGuard(patch: Partial<TargetGuardParams>): boolean;
+  /** 把末端目标安全参数复位为默认（= 无覆写，行为与引入前逐位一致） */
+  resetTargetGuard(): void;
+  /**
    * 由 `transportBridge` 调用：登记 / 注销传输连接。
    * `kind === null` 表示断开，`transportDriven` 随之复位。
    */
@@ -280,6 +319,88 @@ const initialModel = loadRobotModel(INITIAL_ROBOT_ID);
 let logSeq = 0;
 /** 已经为哪些机器人记过"没有逆解器"的日志（避免拖动时刷屏） */
 const warnedNoSolver = new Set<string>();
+
+// ---------------------------------------------------------------------------
+// 末端目标安全参数 —— 辅助（只读计算，不碰算法）
+// ---------------------------------------------------------------------------
+
+/** 与 `ik.ts` 的 `EPS_MM` 同量级；用于"是否真的越过内径"的判定 */
+const EPS_MM_LOCAL = 1e-9;
+
+/**
+ * 目标点 → 腕枢轴到肩枢轴的距离 `d`（mm）。
+ *
+ * ★★ **一律转发 `ik.ts` 的 `ikGeometry()` + `wristSagittal()`，禁止自己拼几何。**
+ *
+ * 为什么必须转发（**这是一个已经发生过的事故**）：
+ *   本函数最初自己按"`pivotZ` = 沿 parent 链累加、`radial` = TCP 参考关节所辖连杆长"
+ *   重算。但 `model.tcp.joint === 'tool'` 时 `wrist.parentLink` 是
+ *   **`forearm_link`（80）**，不是 `tool_link`（40）—— 而 `ik.ts` 的
+ *   `requireConstantToolOffset()` 用的口径是 `toolOffset[0] = 40`。
+ *   于是前置检查报 `d = 92.159` 而 `solveIk` 内部算的是 `d = 111.542`，
+ *   **同一个目标点两个 `d`，相差 19.4mm 且不报错** ——
+ *   症状是"改小外径后本该可达的点被判越界"（错误信息来源随机：有时是这层，
+ *   有时是 `ik.ts` 那层）。违反铁律「同一个量只能有一套口径」。
+ *
+ * 转发是安全的：`ikGeometry()` 会跨三个姿态交叉验证几何假设，前提不成立时
+ * 抛 `IkModelError` 而不是静默算偏；`wristSagittal()` 就是 `solveIk` 自己用的那个。
+ *
+ * ⚠️ 这条 import 会**扩 Core→包的边**，已在 `corePackageBoundary.test.ts`
+ * 的白名单里登记（与既有的 `solveIk` 同一条 import 语句）。
+ */
+function wristDistance(model: RobotModel, target: Vec3): number {
+  const geometry = ikGeometry(model);
+  const { dr, dz } = wristSagittal(geometry, target);
+  return Math.hypot(dr, dz);
+}
+
+/**
+ * 球壳 `[内径, 外径]`（mm）—— **直接转发 `ik.ts` 的 `ikGeometry().reach`**。
+ *
+ * 原实现自己按 `[|l1 − l2|, l1 + l2]` 重算（`l1`/`l2` 取 `shoulder.childLink` /
+ * `elbow.childLink` 的长度）。本机两法数值恰好一致（都是 `[0, 160]`），但
+ * **它和 `ik.ts` 并不是同一份真值** —— `ikGeometry()` 是从 FK 采样反推
+ * （`first.pShoulder` / `requireConstantToolOffset()`），本函数是从连杆表读。
+ * 一旦哪天模型改成带偏移的连杆，两法就会分叉且不报错。
+ * 按铁律「同一个量只能有一套口径」，这里也改为转发。
+ *
+ * ⚠️ 用途仅限于**参数校验**（判 `reachMinMm < 外径`），不参与任何解算。
+ */
+function reachShellOf(model: RobotModel): readonly [number, number] {
+  const { reach } = ikGeometry(model);
+  return reach;
+}
+
+/** 关节状态里第一个 role=base 的关节 id（用于取方位角）；退化取第一个键 */
+function baseIdOrFirst(model: RobotModel): string {
+  return jointByRole(model, 'base')?.id ?? model.joints[0]?.id ?? '';
+}
+
+function fmtVec(p: Vec3): string {
+  return `(${p[0].toFixed(3)}, ${p[1].toFixed(3)}, ${p[2].toFixed(3)})`;
+}
+
+/**
+ * 在容差 `toleranceDeg` 内挑一个"最接近可行"的候选解。
+ *
+ * 判据与 `ik.ts` 的 `feasible` 同构（`violation <= tolerance`），但**只在
+ * 调用方显式开启容差时**才走这条路径 —— 默认 0 时根本不会调用本函数，
+ * 于是 Phase 6 的冻结语义（越界即拒绝）不受任何影响。
+ *
+ * @returns 取 `violation` 最小的那支；全部超出容差时返回 `null`
+ */
+function pickWithinTolerance<C extends { violation: number; feasible: boolean }>(
+  candidates: readonly C[],
+  toleranceDeg: number,
+): C | null {
+  let best: C | null = null;
+  for (const candidate of candidates) {
+    if (candidate.violation > toleranceDeg) continue;
+    if (best === null || candidate.violation < best.violation) best = candidate;
+  }
+  return best;
+}
+
 function makeLogEntry(kind: LogEntry['kind'], text: string): LogEntry {
   logSeq += 1;
   const now = new Date();
@@ -300,8 +421,7 @@ function defaultTeachName(): string {
  * ★ `model` 是显式参数而非常量：切换机器人后限位整体不同，
  * 用旧模型的限位去裁新模型的关节会**静默**产出越界角
  * （然后被后端如实拒绝，表现为"命令没反应"）。
- */
-function clipJointState(model: RobotModel, partial: Partial<JointState>): JointState {
+ */function clipJointState(model: RobotModel, partial: Partial<JointState>): JointState {
   const out: JointState = {};
   for (const id of jointIds(model)) {
     const joint = model.joints.find((j) => j.id === id);
@@ -359,6 +479,10 @@ export const useRobotStore = create<RobotStore>((set, get) => {
     ikStatus: null,
     dragPlane: 'xy',
     dragging: false,
+
+    // 末端目标安全参数：默认全部退化为"无覆写"⇒ 不配置时行为与引入前逐位一致
+    targetGuard: { ...DEFAULT_TARGET_GUARD_PARAMS },
+    targetGuardError: null,
 
     // 默认 Simulation：防止网页一打开就直接控制真实机械臂（spec §三十一）
     mode: 'simulation',
@@ -470,6 +594,8 @@ export const useRobotStore = create<RobotStore>((set, get) => {
 
     moveTo(xyz, opts = {}) {
       const current = get();
+      // ⚠️ 能力门与后续的 `clipJointState` 都读**原始模型**（限位与能力是"这台机器人
+      //    是什么"，不该被会话参数改写）；只有喂给 `solveIk` 的那份才施加限位收紧。
       const m = current.model;
 
       // ---- 能力门：本机器人有没有逆解器？ ----
@@ -509,16 +635,70 @@ export const useRobotStore = create<RobotStore>((set, get) => {
 
       // `prefer: 'nearest'` + `near: 当前命令角` —— 拖动经过工作空间内边界时不翻支；
       // `seed: 当前命令角` 让夹爪等未参与解算的关节保持原值，返回值可直接喂 FK 闭环。
-      const result = solveIk(m, xyz, {
+      const guard = current.targetGuard;
+
+      // ---- 参数层①：球壳内径 / 外径覆写（独立的前置检查） ----
+      //
+      // ⚠️ 为什么在这里而不是改 `ik.ts`：`reach` 是在 `ik.ts` 的 `ikGeometry()`
+      //    内部由杆长算出来的（本机 `[0, 160]`），外部无法覆写；而 `ik.ts` 同时被
+      //    sim2sim（bridge 直接调 `solveIk`）与 sim2real 共用，改它是"改算法"。
+      //
+      // 内径：`reachMinMm ≥ 0.1` 恒大于 `ik.ts` 的原内径 `|l1 − l2| = 0`
+      //       （本机 l1 = l2 = 80）⇒ 这道检查**只会更严**，原判据被完全包含。
+      //
+      // 外径：⚠️ 与内径不同，外径**必须真正参与解算**（经 `opts.reachMaxMm` 传给
+      //       `solveIk`，见下方）。这里的前置检查**不是**判据本体，而是为了
+      //       给出更好的报错信息：`ik.ts` 在 `d > reachMax` 时返 `OUT_OF_WORKSPACE`
+      //       且**不带 candidate**，容差层就没有候选可用，错误信息里也不会有
+      //       "是覆写后的外径"这个关键上下文。
+      //
+      // ⚠️ `dWrist` 只需在任一覆写生效时计算（两处判据共用同一个值）。
+      //
+      // ⚠️ 副作用（刻意保留）：`solveIk` 被**直接调用**的地方（sim2sim bridge）
+      //    既看不到这道检查、也不会传 `opts.reachMaxMm` ⇒ 覆写不会外溢，
+      //    符合需求「不影响 sim2sim / sim2real」。
+      //
+      // ⚠️ 两项覆写都默认 false ⇒ 整个块不进，行为与引入本特性前逐位相同。
+      const reachOverridden = guard.reachMinOverridden || guard.reachMaxOverridden;
+      const dWrist = reachOverridden ? wristDistance(current.model, xyz) : 0;
+
+      if (reachOverridden && guard.reachMinOverridden && dWrist < guard.reachMinMm - EPS_MM_LOCAL) {
+        const message =
+          `目标 ${fmtVec(xyz)} 超出工作空间：腕枢轴到肩枢轴的距离 ${dWrist.toFixed(3)}mm ` +
+          `小于设定的球壳内径 ${guard.reachMinMm.toFixed(3)}mm（内径覆写生效中）`;
+        set({
+          target: [xyz[0], xyz[1], xyz[2]],
+          ikStatus: { ok: false, reason: 'OUT_OF_WORKSPACE', message },
+        });
+        return { success: false, reason: 'OUT_OF_WORKSPACE', message, candidates: [] };
+      }
+
+      if (reachOverridden && guard.reachMaxOverridden && dWrist > guard.reachMaxMm + EPS_MM_LOCAL) {
+        const message =
+          `目标 ${fmtVec(xyz)} 超出工作空间：腕枢轴到肩枢轴的距离 ${dWrist.toFixed(3)}mm ` +
+          `大于设定的球壳外径 ${guard.reachMaxMm.toFixed(3)}mm（外径覆写生效中）`;
+        set({
+          target: [xyz[0], xyz[1], xyz[2]],
+          ikStatus: { ok: false, reason: 'OUT_OF_WORKSPACE', message },
+        });
+        return { success: false, reason: 'OUT_OF_WORKSPACE', message, candidates: [] };
+      }
+
+      // ⚠️ `reachMaxOverrideFor` 不覆写时返回 `undefined` ⇒ `ik.ts` 走原分支
+      //    （用 `ikGeometry()` 求导出的 `reach[1]`），逐位一致。
+      //    覆写时它替换掉那个外径，于是 2R 的 `cosAlpha` 按新外径求解 ——
+      //    这就是"外径覆写真正参与计算"的落点。
+      const result = solveIk(current.model, xyz, {
         prefer: opts.prefer ?? 'nearest',
         near: current.commandJoints,
         seed: current.commandJoints,
+        reachMaxMm: reachMaxOverrideFor(guard),
       });
 
       if (result.success) {
-        const joints = clipJointState(m, result.joints);
+        const joints = clipJointState(current.model, result.joints);
         set({
-          ...deriveVirtual(m, joints, false, current.transportDriven),
+          ...deriveVirtual(current.model, joints, false, current.transportDriven),
           target: [xyz[0], xyz[1], xyz[2]],
           ikStatus: {
             ok: true,
@@ -527,19 +707,59 @@ export const useRobotStore = create<RobotStore>((set, get) => {
             azimuth: result.azimuth,
           },
         });
-      } else {
-        // ⚠️ 目标越界时关节**逐位不变**（Phase 6 已拍板）：保留 target 让用户看到"差多远"，
-        //    但绝不静默钳位 —— 钳位会让工作空间边界从界面上消失，也无法保证钳位点满足关节限位。
-        set({
-          target: [xyz[0], xyz[1], xyz[2]],
-          ikStatus: {
-            ok: false,
-            reason: result.reason,
-            joint: result.joint,
-            message: result.message,
-          },
-        });
+        return result;
       }
+
+      // ---- 参数层②：判据容差（默认 0 ⇒ 完全走原有分支，行为逐位不变） --------
+      //
+      // `ik.ts` 的可行判据是 `violation <= 1e-9`，而界面 XYZ 只显示 1 位小数
+      // ⇒ 极限点回输必然被拒（实测差 0.0038°）。容差 T 让"差一点点"的解通过，
+      // 随后被 `clipJointState` **钳到限位上**，末端偏差 `≈ L·sin(T)`。
+      //
+      // ⚠️ T 的上限 1.0° 由"硬误差 ≤ 2%"反推（见 `parameterOverrides.ts`）。
+      // ⚠️ 默认 T = 0 ⇒ 下面的分支不进，13 条 Phase 6 冻结断言继续通过。
+      // ⚠️ 只在 `!result.success` 时才有意义：成功路径已经返回了。
+      if (guard.jointToleranceDeg > 0) {
+        const relaxed = pickWithinTolerance(result.candidates, guard.jointToleranceDeg);
+        if (relaxed) {
+          // ⚠️ 钳位是**有意为之**：解出的角可能越界 ≤ T，必须裁回限位才敢下发。
+          //    这正是"硬误差"的来源，也是 T 必须 ≤ 1.0° 的原因。
+          const joints = clipJointState(current.model, relaxed.joints);
+          const achieved = endEffectorPose(current.model, joints).position;
+          const residual = Math.hypot(
+            achieved[0] - xyz[0],
+            achieved[1] - xyz[1],
+            achieved[2] - xyz[2],
+          );
+          const baseId = baseIdOrFirst(current.model);
+          const azimuth = joints[baseId] ?? 0;
+          set({
+            ...deriveVirtual(current.model, joints, false, current.transportDriven),
+            target: [xyz[0], xyz[1], xyz[2]],
+            ikStatus: { ok: true, branch: relaxed.branch, residual, azimuth },
+          });
+          return {
+            success: true,
+            joints,
+            branch: relaxed.branch,
+            residual,
+            azimuth,
+            relativeAngle: relaxed.relativeAngle,
+          };
+        }
+      }
+
+      // ⚠️ 目标越界时关节**逐位不变**（Phase 6 已拍板）：保留 target 让用户看到"差多远"，
+      //    但绝不静默钳位 —— 钳位会让工作空间边界从界面上消失，也无法保证钳位点满足关节限位。
+      set({
+        target: [xyz[0], xyz[1], xyz[2]],
+        ikStatus: {
+          ok: false,
+          reason: result.reason,
+          joint: result.joint,
+          message: result.message,
+        },
+      });
       return result;
     },
 
@@ -557,6 +777,40 @@ export const useRobotStore = create<RobotStore>((set, get) => {
 
     setDragging(value) {
       set({ dragging: value });
+    },
+
+    setTargetGuard(patch) {
+      const current = get();
+      const candidate: TargetGuardParams = { ...current.targetGuard, ...patch };
+      try {
+        // ⚠️ 校验需要"求导球壳"来判 `reachMinMm < 生效外径` 与
+        //    `reachMaxMm ≤ 几何外径`。两者都由连杆长度决定（本机 `l1 + l2 = 160`），
+        //    与覆写无关 ⇒ 不需要在这里跑 IK 几何求导，直接用同一来源的链长算。
+        const normalized = normalizeTargetGuardParams(candidate, {
+          reach: reachShellOf(current.model),
+        });
+        set({ targetGuard: normalized, targetGuardError: null });
+        // ⚠️ 覆写改动必须**立刻**影响视口里的工作空间提示（把手球颜色 / 虚线），
+        //    但 `moveTo` 只在"下一个目标"时才跑。所以这里主动把**当前 target**
+        //    重解一次：参数一变，判定与显示就同步。
+        //    · 默认参数下 `target` 恰好是可达点时，重解结果与原状态一致 ⇒ 无副作用。
+        //    · 用 `resetTargetGuard` 复位时不需要（它本就是"回到默认"，且
+        //      重解会让"参数复位"意外改动关节）—— 只在本 setter 里做。
+        const [tx, ty, tz] = current.target;
+        get().moveTo([tx, ty, tz]);
+        return true;
+      } catch (error) {
+        // ⚠️ 拒绝写入而**保留旧值**：一个越界的容差会让"硬误差 ≤ 2%"的承诺失效，
+        //    而界面上看不出任何异常。宁可原样不动 + 明说原因。
+        const message =
+          error instanceof TargetGuardParamError ? error.message : String(error);
+        set({ targetGuardError: message });
+        return false;
+      }
+    },
+
+    resetTargetGuard() {
+      set({ targetGuard: { ...DEFAULT_TARGET_GUARD_PARAMS }, targetGuardError: null });
     },
 
     setConnection(kind, status, label) {

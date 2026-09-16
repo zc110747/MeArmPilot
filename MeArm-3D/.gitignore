@@ -50,3 +50,8 @@ __pycache__/
 # ---- 无头浏览器 profile（e2e / CDP 探针产生，纯缓存垃圾） ----
 **/_edge_profile/
 **/_edge[0-9]*/
+
+# ---- 诊断工具的产物（可重算，故不入库） ----
+# core/tools/out/：ws_scan_mearm_v1.py 的网格扫描输出（234498 采样点 JSON）。
+#   重跑 ws_scan_mearm_v1.py 即可重建；入库只会让 diff 噪音化。
+/core/tools/out/

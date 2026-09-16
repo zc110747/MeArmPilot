@@ -28,6 +28,9 @@ export * from './model/robotIds';
 export * from './model/robotConfigRegistry';
 export * from './model/loadRobotModel';
 export * from './model/linkFeedback';
+// 末端目标「参数覆写」层：只改参数（关节限位收紧 / 球壳内径覆写 / 判据容差），
+// 不碰任何算法。默认值刻意全部退化为"无覆写" ⇒ 不配置时行为与引入前逐位一致。
+export * from './model/parameterOverrides';
 
 export * from './kinematics/transform';
 export * from './kinematics/coordinate';

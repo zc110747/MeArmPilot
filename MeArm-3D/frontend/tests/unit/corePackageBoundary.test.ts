@@ -73,6 +73,13 @@ const ALLOWED: Record<string, readonly string[] | null> = {
   'frontend/src/store/robotStore.ts': [
     // MeArm 解析解的原生入口（行为依赖，见文件头"白名单"一节）
     'solveIk',
+    // ★ 几何真值：安全参数的前置检查**必须**与 solveIk 用同一个 `d`。
+    //   曾经在 store 里自己重算过 —— 因为把 `radial` 取成了 `wrist.parentLink`
+    //   （= forearm_link 80）而不是 `toolOffset[0]`（= 40），同一个目标点算出
+    //   两个 `d`（92.159 vs 111.542，差 19.4mm）且不报错，症状是"改小外径后
+    //   本该可达的点被判越界"。宁可扩这条边，也不要第二个口径。
+    'ikGeometry',
+    'wristSagittal',
     // 四种原生类型：IK 的分支 / 偏好 / 失败原因 / 原生返回形状
     'IkBranch',
     'IkPreference',
