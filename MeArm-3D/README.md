@@ -572,16 +572,20 @@ node core/tools/verify_external_origin.mjs                 # TCP 入口来源标
 node frontend/tests/e2e/external-origin-follow.mjs         # 浏览器侧：外部驱动时主臂与幽灵是否重合（需 8090 后端 + 5273 vite dev）
 ```
 
-**最近一次全绿概要**（2026-09-17 实跑 `tsc` / `vitest` / `go vet` / `go test`）：
+**最近一次全绿概要**（2026-09-17 全量重编后实跑 `tsc` / `vitest` / `go vet` / `go test` / `pytest` / Sim2Sim / 三条链路 e2e）：
 `tsc` 0 error · `vitest` **442 passed**（`Test Files 33 passed`）·
-`go vet` 干净 · `go test` **114 个顶层用例**全绿（6 包 · 0 FAIL）· `pytest` **214 passed**
+`go vet` 干净 · `go test` **114 个顶层用例**全绿（6 包 · 0 FAIL，另有 7 个子测试）·
+`arm-web` `go test` **39 passed** · `pytest` **214 passed**
 （core/tests 31 · tests/sim 167 · tests/sim2sim 9 · robot-package 7）· 真值冻结 ✅ ·
 4 份黄金数据逐位一致 · `verify_device_follow.mjs` sim **23/23** · mujoco **22/22** · serial **23/23**
 （真机；mujoco 连跑 3 次稳定）· 前端 DOM 读「状态 · Status」表 **9/9** ·
-`run_sim2sim.py --all` 覆盖 mearm-v1 + so-arm101 ·
-固件（AVR）FLASH **13104 B**（text 12966 + data 138）/ RAM **849 B**（.data 138 + .bss 711），零警告 ·
-sim2sim 三侧面 **≤8.04e-14 mm**（容差 1e-6 ⇒ 余量 **1.24e7**，跨批 7 seed / 272 组）。
-（`pytest` / 固件资源占用 / sim2sim 残差 / `verify_device_follow.mjs` 各项为 2026-09-16 实测，本轮未重跑。）
+`run_sim2sim.py --all` 覆盖选择器声明的**全部**机器人（现为 mearm-v1 —— `so-arm101` 已于 `178d1f0` 移除）·
+固件（AVR）FLASH **13116 B**（text 12978 + data 138）/ RAM **849 B**（.data 138 + .bss 711），零警告 ·
+sim2sim 三侧面 **≤7.65e-14 mm**（容差 1e-6 ⇒ 余量 **1.3e7**，本轮 40 组用例）。
+（跨批 7 seed / 272 组的 **≤8.04e-14 mm**、`pytest` 分项计数、`verify_device_follow.mjs` 各项为 2026-09-16 实测，本轮未重跑；
+本轮重编后复跑新增的读数：`run_sim2sim.py --all` FK **40/40** · IK 25/28（3 项按设计拒绝）·
+`verify_external_origin.mjs` **3/3** · `sim2sim-check.mjs` **30/30** · `external-origin-follow.mjs` **9/9**。
+固件 FLASH 由 README 原记的 13104 → **13116**：13104 实测为 `ce44827` **之前**那版源码的产物，README 落后一个提交。）
 
 > **真机的证书型数字**（`go test` 计数 / 固件资源占用 / 相机残差）**一律现跑现取**：
 > 三份 README 各抄过一份计数，实测漂移成 147 / 161 / 318 / 425 四个版本。
