@@ -1,8 +1,8 @@
-# ArmPilot：MeArm-V1 基线冻结 + MeArm-3D 最小架构抽象 + Sim2Sim 回归
+# MeArmPilot：MeArm-V1 基线冻结 + MeArm-3D 最小架构抽象 + Sim2Sim 回归
 
 ## 0. 任务定位
 
-你正在维护 ArmPilot 项目。
+你正在维护 MeArmPilot 项目。
 
 当前项目已经完成并能够测试：
 
@@ -54,7 +54,7 @@ MeArm-V1
 
 它是：
 
-> ArmPilot 第一个正式 Robot Model，也是后续所有通用化开发的 Reference Robot / Golden Baseline。
+> MeArmPilot 第一个正式 Robot Model，也是后续所有通用化开发的 Reference Robot / Golden Baseline。
 
 ---
 

@@ -1,8 +1,8 @@
-# ArmPilot：SO-ARM101 模型转换 + 后端配置驱动模型切换 + Sim2Sim 验证
+# MeArmPilot-ARM101 模型转换 + 后端配置驱动模型切换 + Sim2Sim 验证
 
 ## 一、任务目标
 
-当前 ArmPilot 已经完成：
+当前 MeArmPilot 已经完成：
 
 1. MeArm-V1 基线冻结
 2. MeArm-3D 最小 Robot 架构抽象
@@ -13,7 +13,7 @@
 
 本阶段只做一个事情：
 
-> 引入第二个与 MeArm-V1 结构明显不同的机器人：SO-ARM101，用于验证 ArmPilot 的多机器人模型抽象是否真正成立。
+> 引入第二个与 MeArm-V1 结构明显不同的机器人：SO-ARM101，用于验证 MeArmPilot 的多机器人模型抽象是否真正成立。
 
 模型选择暂时只允许通过后端配置文件修改。
 
@@ -316,11 +316,11 @@ assets/*
 ```text
 官方模型
     ↓
-ArmPilot Robot Model
+MeArmPilot Robot Model
     ↓
-ArmPilot 3D
+MeArmPilot 3D
     ↓
-ArmPilot MuJoCo
+MeArmPilot MuJoCo
 ```
 
 而不是：
@@ -372,7 +372,7 @@ SO-ARM101
 * dynamics
 * simulation regression
 
-不要要求 URDF 和 MJCF 在当前阶段由 ArmPilot 自动互转。
+不要要求 URDF 和 MJCF 在当前阶段由 MeArmPilot 自动互转。
 
 ---
 
@@ -509,7 +509,7 @@ fk-cases.json
 ```text
 Joint
  ↓
-ArmPilot FK
+MeArmPilot FK
  ↓
 End Effector Pose A
 
@@ -965,7 +965,7 @@ MuJoCo
 end effector pose
 ```
 
-与 ArmPilot FK 对比。
+与 MeArmPilot FK 对比。
 
 ---
 
@@ -1134,7 +1134,7 @@ license/source information
 
 ```text
 哪些内容直接使用官方模型
-哪些内容由 ArmPilot 适配
+哪些内容由 MeArmPilot 适配
 为什么需要适配
 ```
 

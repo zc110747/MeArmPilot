@@ -2,7 +2,7 @@
 
 你是一名机器人运动学、Three.js、React、机械臂控制和嵌入式通信专家。
 
-现在开发 ArmPilot 第一阶段。
+现在开发 MeArmPilot 第一阶段。
 
 本阶段的核心目标只有一个：
 
@@ -19,7 +19,7 @@
 系统必须实现：
 
 ```text
-                 ArmPilot
+                 MeArmPilot
                     │
               RobotModel
                     │
@@ -1029,7 +1029,7 @@ ERROR LIMIT
 后续可以升级为：
 
 ```text
-ArmPilot Serial Protocol v1
+MeArmPilot Serial Protocol v1
 ```
 
 但必须保持：
@@ -1537,7 +1537,7 @@ Error
 推荐：
 
 ```text
-ArmPilot/
+MeArmPilot/
 
 ├── frontend/
 │

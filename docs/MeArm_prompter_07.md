@@ -1,8 +1,8 @@
-# ArmPilot mini_robot Robot Package 验证任务
+# MeArmPilot mini_robot Robot Package 验证任务
 
 ## 1. 任务目标
 
-在当前 ArmPilot 已完成的：
+在当前 MeArmPilot 已完成的：
 
 ```text
 Core
@@ -22,7 +22,7 @@ Validation
 
 `mini_robot` 的唯一目的不是作为正式机器人使用，而是作为：
 
-> **ArmPilot Robot Package Framework 的最小验证样本（Reference Test Robot）**
+> **MeArmPilot Robot Package Framework 的最小验证样本（Reference Test Robot）**
 
 用于验证当前框架是否真正实现：
 
@@ -314,7 +314,7 @@ joints:
     home: 0
 ```
 
-具体格式必须遵循当前 ArmPilot Robot Package Specification。
+具体格式必须遵循当前 MeArmPilot Robot Package Specification。
 
 不要为了 mini_robot 新建第二套 Manifest 格式。
 

@@ -1,10 +1,10 @@
-# ArmPilot Robot Package + Working Robot 架构级重构
+# MeArmPilot Robot Package + Working Robot 架构级重构
 
 ## 0. 任务性质
 
-这是一次 **ArmPilot 架构级重构**，不是普通功能开发。
+这是一次 **MeArmPilot 架构级重构**，不是普通功能开发。
 
-当前 ArmPilot 已经完成并冻结了 MeArm-V1 的 Golden Baseline：
+当前 MeArmPilot 已经完成并冻结了 MeArm-V1 的 Golden Baseline：
 
 ```text
 MeArm-V1
@@ -34,12 +34,12 @@ MeArm-V1
 
 而是：
 
-> **建立真正的 Robot Package + Working Robot 架构，使机器人特有实现与 ArmPilot Core 解耦，同时保留所有真正共享的框架代码。**
+> **建立真正的 Robot Package + Working Robot 架构，使机器人特有实现与 MeArmPilot Core 解耦，同时保留所有真正共享的框架代码。**
 
 最终达到：
 
 ```text
-                         ArmPilot
+                         MeArmPilot
                             │
               ┌─────────────┴─────────────┐
               │                           │
@@ -246,7 +246,7 @@ build metadata
 最终目标：
 
 ```text
-ArmPilot/
+MeArmPilot/
 │
 ├── core/
 │   │
@@ -1521,7 +1521,7 @@ Calibration
 
 不要根据图片重新猜机械结构。
 
-如果官方模型与 ArmPilot Package 存在接口差异：
+如果官方模型与 MeArmPilot Package 存在接口差异：
 
 ```text
 Official Model
@@ -1683,7 +1683,7 @@ Observation
 最终 Agent 不应该：
 
 ```text
-修改 ArmPilot
+修改 MeArmPilot
  ↓
 加入某机械臂
 ```
@@ -2089,7 +2089,7 @@ Core 不包含 MeArm/SO101 特殊实现。
 完成后，必须能够清晰解释：
 
 ```text
-                   ArmPilot Core
+                   MeArmPilot Core
                          │
        ┌─────────────────┼─────────────────┐
        ↓                 ↓                 ↓
@@ -2143,7 +2143,7 @@ Working Robot
 Core ≠ MeArm
 Core ≠ SO101
 
-Robot Package ≠ 一套完整 ArmPilot
+Robot Package ≠ 一套完整 MeArmPilot
 
 Working Robot ≠ 第二套源码
 ```
@@ -2151,7 +2151,7 @@ Working Robot ≠ 第二套源码
 最终：
 
 ```text
-1 个 ArmPilot Core
+1 个 MeArmPilot Core
 +
 N 个 Robot Package
 +
@@ -2189,7 +2189,7 @@ N 套 Core
                  │                   │
                  └─────────┬─────────┘
                            ↓
-                    ArmPilot Runtime
+                    MeArmPilot Runtime
                            │
                            ↓
                     Simulation / Robot
@@ -2206,12 +2206,12 @@ STEP / URDF / MJCF / CAD
           ↓
       Working Robot
           ↓
-       ArmPilot
+       MeArmPilot
 ```
 
 最终使 Agent 的工作边界从：
 
-> **“修改 ArmPilot 源码以适配一个机器人”**
+> **“修改 MeArmPilot 源码以适配一个机器人”**
 
 转变为：
 

@@ -1,10 +1,10 @@
-# ArmPilot MeArm：MuJoCo 真实物理仿真开发任务
+# MeArmPilot MeArm：MuJoCo 真实物理仿真开发任务
 
 ## 1. 项目背景
 
 当前项目：
 
-`https://github.com/zc110747/ArmPilot`
+`https://github.com/zc110747/MeArmPilot`
 
 重点目录：
 
@@ -62,7 +62,7 @@
                            │ API / WebSocket
                            ▼
                 ┌─────────────────────┐
-                │   ArmPilot Backend  │
+                │   MeArmPilot Backend  │
                 │                     │
                 │ Control API         │
                 │ IK / FK             │
@@ -411,7 +411,7 @@ Y = forward/back
 Z = up
 ```
 
-具体方向以当前 ArmPilot 项目为准。
+具体方向以当前 MeArmPilot 项目为准。
 
 禁止通过“视觉上旋转模型”解决坐标系错误。
 
@@ -784,7 +784,7 @@ static equilibrium
 }
 ```
 
-根据当前 ArmPilot API 实际结构进行兼容。
+根据当前 MeArmPilot API 实际结构进行兼容。
 
 必须同时支持：
 
@@ -797,14 +797,14 @@ Cartesian State
 
 # 20. FK 验证
 
-MuJoCo 的 FK 结果必须与现有 ArmPilot FK 结果进行对比。
+MuJoCo 的 FK 结果必须与现有 MeArmPilot FK 结果进行对比。
 
 建立测试：
 
 ```text
 输入 joint angles
         ↓
-ArmPilot FK
+MeArmPilot FK
         ↓
 XYZ_A
 
@@ -1462,7 +1462,7 @@ arm ↔ arm
 FK 对比：
 
 ```text
-ArmPilot FK
+MeArmPilot FK
 vs
 MuJoCo FK
 ```
@@ -1764,7 +1764,7 @@ logging
 完成后：
 
 ```text
-                   ArmPilot
+                   MeArmPilot
                       │
         ┌─────────────┴─────────────┐
         │                           │
@@ -1952,7 +1952,7 @@ controller
 
 而是建立：
 
-> **ArmPilot 的统一机器人仿真抽象层。**
+> **MeArmPilot 的统一机器人仿真抽象层。**
 
 让同一套：
 
