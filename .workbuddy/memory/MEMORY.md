@@ -1,7 +1,7 @@
 # ArmPilot 大工程 · 长期记忆
 
-> 跨子项目、长期有效的约定。子项目细节在各子项目 `.workbuddy/memory/`；
-> 可复用方法论放 skill（不放 memory）。保持简洁、去本机绝对路径、不写凭据。
+> 跨子项目、长期有效的约定。子项目细节在各子项目 `.workbuddy/memory/`；方法论放 skill，不放 memory。
+> 保持简洁、去本机绝对路径、不写凭据。
 
 ## 一、工程构成与链路
 
@@ -12,7 +12,7 @@
 | `MeArm-3D/` | Go 关节级后端 + React/Three.js 孪生前端 | 8090 `/ws/joint` · 9100 TCP JSON Lines · 5273 vite |
 
 链路（端口刻意错开）：孪生前端→8090；遥控台 serial→9002 透传；遥控台 network→**TCP Client 连 9100**
-（经 MeArm-3D 落 sim/real，**不经 Uno**）。判遥控台模式看 **9002 是否 LISTENING**。
+（经 MeArm-3D 落 sim/real，**不经 Uno**）。
 
 ## 二、铁律
 
@@ -26,18 +26,17 @@
 4. **建新目录前先探针** `git check-ignore -v <dir>/probe.txt`：根 `.gitignore` 是 STM32 黑名单
    （`Drivers`/`third_party`/`Debug`(含小写)/`Build`/`Release`/`obj`）。`.workbuddy/skills/` 实测安全。
 5. **git push 由用户执行**，agent 只做本地 commit / diff / branch。
-6. **跨链路复用方向配置必须先做语义换算**：serial 的 `invert_*` 内含一层 arm-device 固件补偿
-   （`core/joystick.c`：8 轴出厂反相、9/6/7 轴 `raw>800 → 负步长`），TCP 链路没有固件层
-   ⇒ 直接复用会让两种模式**推杆方向正好相反**且都"看起来正常"。
-   入口 = `MeArm-RemoteControl/internal/protocol.NetInvertFor`（8 轴保持、其余取反）。
+6. **跨链路复用方向配置必须先做语义换算**：serial 的 `invert_*` 含一层 arm-device 固件补偿
+   （`core/joystick.c`），TCP 链路无固件层 ⇒ 直接复用会让两种模式**推杆方向正好相反**且都"看起来正常"。
+   入口 = `internal/protocol.NetInvertFor`（8 轴保持、其余取反）。
 7. **给"本页↔设备"链路加第三方入口时，入口必须在协议里标注身份（origin）。** 前端只对
    `origin==='device'` 做命令侧跟随（写 `commandJoints` + 抑制回发），其余只写 `actualJoints`
-   ⇒ 借用 `command` 会表现为**幽灵动、主臂不动**（2026-09-17 实测 8/8 帧）。
-   真正危险的是本页 `commandJoints` 停在旧值，下次操作把**整组旧指令**下发 ⇒ 真机跳回旧位姿。
-   已修：新增 `OriginExternal`（ADR D84）。**来源必须随命令同行**，不能等状态帧到了再从 `inflight` 取。
-8. **不要承诺"服务还留着给你手测"**：用户重跑 `start.bat` 会按端口 `taskkill`，连带杀掉 agent 的
-   后台实例；且 `.bat` 用 `start` 起独立窗口 ⇒ 其运行期日志 agent 读不到。交代环境状态就**现场复核**
-   （端口 + 进程 StartTime），别引用上次结论。
+   ⇒ 借用 `command` 会表现为**幽灵动、主臂不动**（2026-09-17 实测 8/8 帧）；真正危险的是本页
+   `commandJoints` 停在旧值，下次操作把**整组旧指令**下发 ⇒ 真机跳回旧位姿。
+   已修：新增 `OriginExternal`（ADR D84）；**来源须随命令同行**（不能等状态帧再从 `inflight` 取）。
+8. **别承诺"服务还留着给你手测"**：用户重跑 `start.bat` 会按端口 `taskkill` 掉 agent 的后台实例，
+   且 `.bat` 用 `start` 起独立窗口 ⇒ 其运行期日志 agent 读不到。交代环境状态要**现场复核**
+   （端口 + 进程 StartTime），别引用上次结论。详库 → `~/.workbuddy/playbook.md` §3.4。
 
 ## 三、验收节奏与基线
 
@@ -53,16 +52,13 @@
 
 1. 清残留：`taskkill //F //IM armpilot-backend.exe` + `arm-web.exe`，再逐个清
    8090/9100/9001/5273 的 LISTENING PID。
-2. **必须用不带 `VITE_AUTO_*` 的干净 vite dev** —— 否则页面自动连后端，读数类断言被回推干扰，
-   出现与代码无关的 FAIL。
-3. **判遥控台模式看 9002 是否 LISTENING**：serial 会监听、network 不监听（比翻日志可靠）；
-   9001 两种模式都监听。
+2. **必须用不带 `VITE_AUTO_*` 的干净 vite dev** —— 否则页面自动连后端，读数类断言被回推干扰 ⇒ 假 FAIL。
+3. **判遥控台模式看 9002 是否 LISTENING**（serial 监听、network 不监听；9001 两种都监听）。
 
 ## 五、skill 与文档落点
 
-- skill 全清单由系统每会话注入，此处不重复。**入口 = `.workbuddy/skills/armpilot-workspace/SKILL.md`**
-  （含**真实**路由表 + 已缺失 skill 清单：`arm-robot-serial` / `arm-ws-joint-link` /
-  `arm-backend-new-ingress` / `arm-mechanism-photogrammetry` / `arm-mujoco-physics-sim` **均已不在磁盘上**）。
+- skill 全清单由系统每会话注入，此处不重复；**入口 = `.workbuddy/skills/armpilot-workspace/SKILL.md`**
+  （含真实路由表与**已缺失 skill 清单** —— 旧文档引用的 5 个 `arm-*` 均已不在磁盘上）。
 - ⚠️ 后端**没有** FK/IK；XYZ→关节角只能走「冻结基线 + 三条实现互证」（`simulation/mujoco/sim2sim.py`
   + `fkref.py`，入口 `core/tools/run_sim2sim.py`），**不要自证**。
 - 设计决策 → `MeArm-3D/docs/decisions.md`（最新在前）；项目全貌/验收数据 → 各子项目 `README.md`；
