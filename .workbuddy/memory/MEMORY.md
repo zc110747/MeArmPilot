@@ -43,9 +43,8 @@
 先出计划并确认 → 实现 → 零警告（tsc 0 error / 双构）→ 单测 → 生产构建 → e2e →
 增量汇报 + 同步 README / ADR / memory。新模块动手前**必先出实现计划**。
 
-基线（2026-09-17 实跑）：孪生前端 vitest **442**（33 文件）· 后端 go test **114** 顶级用例
-（6 包，`go vet` 干净）· 遥控台 go test **39**（`-race` 干净）· Sim2Sim **30** ·
-来源分段 `core/tools/verify_external_origin.mjs` **3** · 浏览器外部驱动跟随
+基线（2026-09-17 实跑）：vitest **442**（33 文件）· go test **114**（6 包，`go vet` 干净）·
+遥控台 go test **39**（`-race` 干净）· Sim2Sim **30** · `verify_external_origin.mjs` **3** ·
 `tests/e2e/external-origin-follow.mjs` **9**。
 
 ## 四、跑 e2e 前置（最常复发的假 FAIL）
