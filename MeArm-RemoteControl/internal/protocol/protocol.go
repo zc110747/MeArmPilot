@@ -42,6 +42,56 @@ func DefaultAxisMap() AxisMap {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 摇杆方向：串口 invert_* ⇄ 网络链路 invert 的换算
+// ---------------------------------------------------------------------------
+
+// FirmwareInvertsAxis 报告 arm-device 固件对该舵机 id 的「摇杆 raw → 步长方向」
+// 是否与其它三轴相反。
+//
+// 真值来源（唯一）：`MeArm-Device/core/joystick.c` 的 joystick_delta()
+//
+//	bool positive = (id == 8) ? past_hi : past_lo;
+//
+// 即 9/6/7 三轴是 raw<200 → 正步进，唯独 8 轴反过来（raw>800 → 正步进）。
+// `config.yaml` 里 `lx/rx/ry = true、ly = false` 这组出厂默认值，
+// 正是为了把这个不一致抹平，使"推杆正方向 → 该舵机角度增大"对四轴都成立。
+func FirmwareInvertsAxis(armServoID int) bool { return armServoID == 8 }
+
+// NetInvertFor 把串口链路的 `joystick.invert_*` 换算成**网络链路**
+// （TCP → MeArm-3D 的 `servo` 绝对角）应当使用的反向标志。
+//
+// ⚠️ 为什么不能原样复用：串口链路上"推杆正方向 → 舵机角度增大"这个结果，
+//    是由 `invert_*` **和固件的方向差异**共同决定的；而 TCP 链路直达
+//    MeArm-3D 的 `servo`，中间**没有固件这一层**。把 invert 原样搬过去，
+//    两种模式的推杆方向会**正好相反**（推右：串口角度增大 / 网络角度减小）。
+//
+// 推导（s = 推杆方向符号，+1 为网页上的正方向）：
+//
+//	串口：axisRaw 先把 |v| 映到 raw，再在 inv 时镜像（raw ← 1023-raw），
+//	      故 raw-512 的符号 P：
+//	          P = inv ? -s : +s        （居中值 512 不参与镜像）
+//	      固件步长符号：
+//	          axes 9/6/7（固件正常）  = -P = inv ? +s : -s
+//	          axis 8    （固件反相）  = +P = inv ? -s : +s
+//	网络：axisSpeed 只在 inv 时取负，故步长符号 = netInv ? -s : +s
+//
+// 令两种模式对同一个 s 得到**同号**的步长：
+//
+//	axes 9/6/7 → netInv = !inv
+//	axis 8     → netInv = inv
+//
+// 代入出厂默认（9/6/7 inv=true、8 inv=false）⇒ 四轴 netInv 全为 false，
+// 即网络模式下"推杆正方向 = 该舵机角度增大"，与串口模式手感一致。
+// 用户若为适配实际机构改了某个 invert，两种模式会**一起**翻转 ——
+// 这正是"一个旋钮管两处"的意图：不出现第二份方向真值。
+func NetInvertFor(armServoID int, inv bool) bool {
+	if FirmwareInvertsAxis(armServoID) {
+		return inv
+	}
+	return !inv
+}
+
 // Validate 校验一条原始命令是否符合 arm-device 语法。
 // 返回 (ok, normalized, error)。normalized 是规整后的下发文本（去除多余空白）。
 // 由于固件对所有字面量用 PSTR 且容忍大小写，这里做宽松但安全的校验：

@@ -16,7 +16,8 @@
 import type { ControlSource, JointState, Pose } from './Pose';
 
 /**
- * 这帧状态**由谁引起**（对应后端 `protocol.OriginCommand` / `OriginDevice`）。
+ * 这帧状态**由谁引起**（对应后端 `protocol.OriginCommand` / `OriginDevice` /
+ * `OriginExternal`）。
  *
  * 为什么需要它：设备侧会**自主变化** —— 硬件摇杆、红外遥控、面板手拧，
  * 都不经过本机命令。前端要不要让命令侧跟着走，只取决于这一点。
@@ -28,7 +29,7 @@ import type { ControlSource, JointState, Pose } from './Pose';
  * ⚠️ 名字不能叫 `JointOrigin`：`model/Joint.ts` 已经导出同名类型
  * （那是关节的局部坐标系原点），`robot/index.ts` 的 `export *` 会撞名。
  */
-export type StateOrigin = 'command' | 'device';
+export type StateOrigin = 'command' | 'device' | 'external';
 
 export interface RobotState {
   joints: JointState;

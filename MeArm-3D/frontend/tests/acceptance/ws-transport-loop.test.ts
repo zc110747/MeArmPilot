@@ -409,6 +409,74 @@ describe('WebSocket 接线 · 设备侧自主变化（origin=device）', () => {
   });
 });
 
+describe('WebSocket 接线 · 外部入口驱动（origin=external）', () => {
+  /** 先消费掉首次接管握手，此后才是稳态 */
+  async function steady(): Promise<Harness> {
+    const h = await connected();
+    h.factory.last.deliver({ version: 1, type: 'joint_state', joints: { ...home } });
+    return h;
+  }
+
+  // 场景：另一台上位机（MeArm-RemoteControl）经 TCP JSON 网关驱动同一个后端。
+  // 后端把它的命令标成 `external` 广播给本页。若不跟随，画面会变成
+  // "只有半透明的实际臂在动、主臂不动"，且本页指令侧停在旧值 ——
+  // 用户下一次动本页任何一个控件，会把**整组旧指令**下发（真机 = 突然跳回去）。
+  it('★ 另一台上位机下命令 ⇒ 命令侧跟随（主臂 / 滑杆不再停在旧值）', async () => {
+    const h = await steady();
+    const before = useRobotStore.getState().commandJoints;
+    const moved = { ...home, base: 30, shoulder: 42 };
+
+    h.factory.last.deliver({
+      version: 1,
+      type: 'joint_state',
+      joints: moved,
+      origin: 'external',
+    });
+
+    const s = useRobotStore.getState();
+    expect(s.commandJoints).not.toBe(before); // 引用级：确实改写了命令侧（= 跟随）
+    expect(s.commandJoints.base).toBeCloseTo(30, 9);
+    expect(s.commandJoints.shoulder).toBeCloseTo(42, 9);
+    // 外部驱动下"命令 = 现状"，两棵树重合
+    expect(s.actualJoints.base).toBeCloseTo(30, 9);
+    expect(s.controlSource).toBe('real');
+
+    // 目标点同步到现状 —— 否则手柄停在旧位置、面板误报"还差多远"
+    const tcp = endEffectorPose(model, s.commandJoints).position;
+    expect(s.target[0]).toBeCloseTo(tcp[0], 9);
+    expect(s.target[2]).toBeCloseTo(tcp[2], 9);
+  });
+
+  it('★ 跟随**绝不**回发命令（两台上位机不对着拽）', async () => {
+    const h = await steady();
+    for (let i = 1; i <= 20; i += 1) {
+      h.factory.last.deliver({
+        version: 1,
+        type: 'joint_state',
+        joints: { ...home, base: 10 + i },
+        origin: 'external',
+      });
+    }
+    h.timer.advance(500); // 足够放掉任何 trailing
+    // 回发即 命令→状态→命令 回环：对方还在驱动，本页又把旧值推回去
+    expect(h.frames('joint_command')).toHaveLength(0);
+  });
+
+  it('日志必须区分"外部入口在驱动"与"设备侧自主变化"（面板是排障第一现场）', async () => {
+    const h = await steady();
+    h.factory.last.deliver({
+      version: 1,
+      type: 'joint_state',
+      joints: { ...home, shoulder: 42 },
+      origin: 'external',
+    });
+    const texts = useRobotStore.getState().log.map((e) => e.text);
+    expect(texts.some((t) => t.includes('外部入口在驱动'))).toBe(true);
+    // 来源是"另一台进程下的命令"，不是设备的摇杆/红外 —— 说错就是对现场的误报
+    expect(texts.some((t) => t.includes('设备侧自主变化'))).toBe(false);
+  });
+});
+
 describe('WebSocket 接线 · 状态面板', () => {
   it('hello 后统计里带上 device 与模型一致性结论', async () => {
     const h = await connected();

@@ -1,4 +1,13 @@
 # 复制为 config.yaml 后修改；所有字段均可配置。
+# 本文件是 config.yaml 的模板，字段与注释保持同步（含 network 段）。
+# ============================================================
+
+# ---- 运行模式 ----
+#   serial  = 原有真机链路：打开串口，走 arm-device 协议（默认，行为不变）
+#   network = 网络链路：**不打开串口**，用 TCP Client 连 MeArm-3D 的 TCP 控制接口
+# `start.bat` 会用命令行 `-mode` 覆盖本值：不带参数 → network；带 --real → serial。
+mode: "serial"
+
 serial:
   port: "COM4"        # Windows: COMx ; Linux/macOS: /dev/ttyUSB0
   baud: 115200
@@ -8,19 +17,47 @@ serial:
   reconnect_sec: 3
   min_interval_ms: 0    # 两条指令下发的最小间隔(毫秒)；ACK门控已防冲刷，默认0(不节流)
   ack_timeout_ms: 800  # 命令-应答超时(毫秒)；超时即判定通讯失败(界面显示)，不自动重发
+  connect_settle_ms: 2500  # Arduino Uno 打开串口触发复位，bootloader 约 2.5s 后交权
 
 web:
   enabled: true
   host: "0.0.0.0"
-  port: 8080
+  port: 9001
   ws_path: "/ws"
 
 tcp:
   enabled: true
   host: "0.0.0.0"
-  port: 9001
+  port: 9002
+  # ⚠️ 本段**仅串口模式生效**：它转发的是 arm-device 文本指令，
+  #    network 模式下没有串口可转发，该服务端不会被启动。
 
 log_level: "info"
+
+# ---- 网络链路：作为 TCP Client 连接 MeArm-3D 的 TCP 控制接口 ----
+# 仅当 mode: "network" 时生效。协议见 MeArm-3D/docs/tcp-control-v1.md。
+# 本服务不做 IK/FK、不做坐标变换、不算舵机角、不做软限位 —— 那是 MeArm-3D 的职责。
+network:
+  host: "127.0.0.1"   # MeArm-3D TCP Server 地址（同机回环；跨机填对方 IP）
+  port: 9100          # MeArm-3D TCP 端口（见其 config.yaml 的 tcp.port）
+  # 接线表（唯一一份）：顺序 = MeArm-3D 侧 servo 数组下标顺序（1-based）。
+  #   MeArm-3D: 1:base 2:shoulder 3:elbow 4:gripper
+  #   固件 id : 9:底座 7:右舵(肩) 8:左舵(肘) 6:夹取
+  servo_ids: [9, 7, 8, 6]
+  deadband_deg: 5            # 摇杆死区(度)；<=该值视为居中
+  min_speed_deg_per_s: 12    # 刚出死区时的角速度
+  max_speed_deg_per_s: 90    # 满偏(31.5°)时的角速度上限
+  tick_ms: 25                # 摇杆积分节流；不满该间隔的帧被合并(latest-wins)
+  max_tick_ms: 200           # 单次积分的 dt 上限(兜底)
+  connect_timeout_ms: 3000
+  request_timeout_ms: 1000
+  reconnect_min_ms: 500      # 断线重连退避下限
+  reconnect_max_ms: 5000     # 断线重连退避上限(不做无限快速重连)
+  queue_size: 64             # 离散命令队列；满则丢最旧
+  auto_sync: true            # 连上后自动发 state 建立基准
+  fallback_angle: 90         # 拿不到基准时的起步角(=mearm-v1 HOME)
+  angle_min: 0               # 本地前置拒绝边界(**不是软限位**)
+  angle_max: 180
 
 # 网页双摇杆 -> 舵机映射（可选；默认 左X=底座9 左Y=左舵8 右X=夹取6 右Y=右舵7）
 # 方向语义：推杆方向 = 舵机角度增大。固件 9/6/7 轴 raw>800->负步长，故默认

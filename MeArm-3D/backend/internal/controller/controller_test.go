@@ -250,6 +250,88 @@ func TestStatePublishesJoints(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 外部入口（TCP JSON v1 / 将来的 MQTT…）
+// ---------------------------------------------------------------------------
+
+// 外部入口下发的命令，其状态帧必须标 **OriginExternal**（不是 `command`）。
+//
+// 判据为什么必须是"来源"而不是"命令被受理"：受理永远成功，而来源标错在 API 层
+// 看不出任何异常 —— 只有 MeArm-3D 自己的页面会表现成"半透明实际臂在动、主臂不动"，
+// 并且它的 commandJoints 停在旧值（用户下一次动本页控件会把**整组旧指令**下发，
+// 真机上就是突然跳回旧位姿）。所以这条链路必须能被断言、能失败。
+//
+// 时序刻意按真实顺序：`OK JR` 先到（放行 ACK 门控、清空 inflight），随后才是
+// 一串 `STATE` 推进帧 —— 来源必须一直有效，不能被"门控放行"抹掉。
+func TestExternalCommandPublishesExternalOrigin(t *testing.T) {
+	h := newHarness(t, DefaultConfig())
+
+	if err := h.ctl.ApplyFrom(protocol.OriginExternal, map[string]float64{"shoulder": 20.8}); err != nil {
+		t.Fatalf("外部来源的命令应被受理: %v", err)
+	}
+	const okLine = "OK JR S9=90.00 S8=90.00 S7=90.00 S6=90.00"
+	h.dev.emit(okLine)
+	h.dev.emit("STATE 0.00 20.80 120.00 50.00")
+
+	if !wait(t, time.Second, func() bool { return h.state() != nil }) {
+		t.Fatal("STATE 应收敛为 joint_state 事件")
+	}
+	if got := h.stateOrigin(); got != protocol.OriginExternal {
+		t.Errorf("外部命令的状态来源 = %q，期望 %q（借用 command 会让对端页面只更新实际位姿）",
+			got, protocol.OriginExternal)
+	}
+
+	// 本页命令必须**回到** `command`：前端对自己发的命令**不该**跟随，
+	// 否则会引入 命令→状态→命令 回环（拖动时设备还在斜坡上，命令侧被拉回半路）。
+	if err := h.ctl.Apply(map[string]float64{"shoulder": 21}); err != nil {
+		t.Fatalf("本页命令应被受理: %v", err)
+	}
+	h.dev.emit(okLine)
+	h.dev.emit("STATE 0.00 21.00 120.00 50.00")
+	if !wait(t, time.Second, func() bool {
+		return h.stateOrigin() == protocol.OriginCommand &&
+			math.Abs(h.state()["shoulder"]-21) < 1e-9
+	}) {
+		t.Errorf("本页命令的状态来源 = %q（shoulder=%v），期望 %q",
+			h.stateOrigin(), h.state()["shoulder"], protocol.OriginCommand)
+	}
+}
+
+// 待发槽（latest-wins）里的命令必须**带着自己的来源**排队、也带着它发出去。
+//
+// 覆盖的是"两台上位机交替驱动"的交错场景：本页命令在途时外部来了新命令，
+// 它只会被合并进待发槽；如果来源在那个槽里丢了（或写成常量），
+// 补发出去的那条就会被标成 `command` —— 对端页面又变成"只更新实际位姿"。
+func TestPendingCommandKeepsItsOrigin(t *testing.T) {
+	h := newHarness(t, DefaultConfig())
+
+	// ① 本页命令在途（此刻不回执，门控保持在途）
+	if err := h.ctl.Apply(map[string]float64{"shoulder": 10}); err != nil {
+		t.Fatalf("本页命令应被受理: %v", err)
+	}
+	// ② 外部命令只能进待发槽（latest-wins），不得排队堆积
+	if err := h.ctl.ApplyFrom(protocol.OriginExternal, map[string]float64{"shoulder": 20}); err != nil {
+		t.Fatalf("外部命令应被受理: %v", err)
+	}
+	if n := h.dev.count(); n != 1 {
+		t.Fatalf("在途期间不得再写设备，实际写入 %d 条", n)
+	}
+
+	// ③ 放行门控 → 待发槽里那条被补发，来源必须跟着它
+	h.dev.emit("OK JR S9=90.00 S8=90.00 S7=90.00 S6=90.00")
+	if !wait(t, time.Second, func() bool { return h.dev.count() == 2 }) {
+		t.Fatalf("待发槽里的命令未被补发（设备写入 %d 条）", h.dev.count())
+	}
+	h.dev.emit("STATE 0.00 20.00 120.00 50.00")
+	if !wait(t, time.Second, func() bool {
+		return h.stateOrigin() == protocol.OriginExternal &&
+			math.Abs(h.state()["shoulder"]-20) < 1e-9
+	}) {
+		t.Errorf("补发命令的状态来源 = %q（shoulder=%v），期望 %q",
+			h.stateOrigin(), h.state()["shoulder"], protocol.OriginExternal)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 设备侧自主变化（摇杆 / 红外 / 手拧）
 // ---------------------------------------------------------------------------
 

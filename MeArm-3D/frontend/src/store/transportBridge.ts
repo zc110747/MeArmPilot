@@ -160,6 +160,12 @@ export class TransportBridge {
    */
   private deviceOriginLogged = false;
 
+  /**
+   * 是否已就"**外部入口**在驱动"记过日志（同一台上位机经 TCP 网关下命令）。
+   * 与 `deviceOriginLogged` 同理只记一次 —— 摇杆持续推动时每帧都会走跟随。
+   */
+  private externalOriginLogged = false;
+
   constructor(options: TransportBridgeOptions = {}) {
     this.timer = options.timer ?? realTimer;
     this.minSendIntervalMs = options.minimumSendIntervalMs ?? MIN_SEND_INTERVAL_MS;
@@ -254,6 +260,7 @@ export class TransportBridge {
     this.suppressCommandSend = false;
     this.blockedSince = 0;
     this.deviceOriginLogged = false;
+    this.externalOriginLogged = false;
 
     // ⚠️ 这里必须**显式**复位，不能指望 transport.disconnect() 发出的 disconnected 事件：
     //    上面已经退订了 status 监听，事件根本没人接。早先的写法就是踩了这个坑 ——
@@ -367,6 +374,19 @@ export class TransportBridge {
       return;
     }
 
+    // ★ **外部入口**在驱动（另一台上位机经 TCP JSON 网关下命令，见
+    //   backend/internal/protocol.OriginExternal）：处理方式与设备侧一致 ——
+    //   命令侧必须跟随。若不跟随，画面会变成"只有半透明的实际臂在动、主臂不动"，
+    //   而且命令行（滑杆 / 目标点）停在旧值：用户下一次动本页任何一个控件，
+    //   会把**整组旧指令**下发（真机上就是机械臂突然跳回旧位姿）。
+    //
+    //   同样必须抑制回发，否则变成 命令 → 状态 → 命令 回环
+    //   （对方还在驱动，本页又把旧值推回去，两侧对着拽）。
+    if (state.origin === 'external') {
+      this.followExternal(state);
+      return;
+    }
+
     store.setActualJoints(state.joints);
   }
 
@@ -379,12 +399,7 @@ export class TransportBridge {
    * "设备自己动 → 上位机又把它推回去"的对抗。
    */
   private followDevice(state: RobotState): void {
-    this.suppressCommandSend = true;
-    try {
-      this.store().followDevice(state.joints);
-    } finally {
-      this.suppressCommandSend = false;
-    }
+    this.alignCommandSide(state);
     // 只记一次：摇杆持续拨动时每帧一行会把日志面板刷满，
     // 而"为什么会跟随"这个信息只需要出现一次。
     if (!this.deviceOriginLogged) {
@@ -393,6 +408,40 @@ export class TransportBridge {
         'in',
         '设备侧自主变化（摇杆 / 红外 / 手拧）—— 命令侧已跟随，未回发命令',
       );
+    }
+  }
+
+  /**
+   * 外部入口（另一台上位机经 TCP JSON 网关）在下命令时的跟随。
+   *
+   * 日志文案必须与 `followDevice` 分开：来源是**外部命令**，不是设备的自主变化 ——
+   * 让日志说出"摇杆/红外/手拧"会是对现场的误报，而这个面板正是排障时最先看的东西。
+   */
+  private followExternal(state: RobotState): void {
+    this.alignCommandSide(state);
+    if (!this.externalOriginLogged) {
+      this.externalOriginLogged = true;
+      this.store().pushLog(
+        'in',
+        '外部入口在驱动（另一台上位机 / TCP 网关）—— 命令侧已跟随，未回发命令',
+      );
+    }
+  }
+
+  /**
+   * 把命令侧对齐到"别人报来的现状"（设备自主变化 / 外部入口命令共用）。
+   *
+   * ⚠️ 必须抑制下发：对齐会写 `commandJoints`，而上面那条 store 订阅把
+   * "命令变化"一律当作用户意图。不抑制的话，每次外部上报都会触发一条命令下发 ——
+   * 那既是 `命令 → 状态 → 命令` 回环，真机侧还会表现为
+   * "别人动 → 本页又把它推回去"的对抗（两台上位机对着拽）。
+   */
+  private alignCommandSide(state: RobotState): void {
+    this.suppressCommandSend = true;
+    try {
+      this.store().followDevice(state.joints);
+    } finally {
+      this.suppressCommandSend = false;
     }
   }
 
@@ -410,6 +459,7 @@ export class TransportBridge {
         store.setConnection(this.transport.kind, 'connected', this.describeCurrent());
         this.commandAuthoredSinceConnect = false;
         this.deviceOriginLogged = false;
+        this.externalOriginLogged = false;
         if (this.hasConnectedOnce) {
           // ⚠️ 只在**重连**时补发：断线期间用户可能已改过命令，
           //    不补发会让虚拟臂与实际臂永久错开而 UI 看不出异常。

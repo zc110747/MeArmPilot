@@ -15,36 +15,45 @@
   ArmWS.on("close", function () { setConn(false); appendLine("== WebSocket 断开 =="); });
   ArmWS.on("err", function (msg) { appendLine("[错误] " + msg, true); });
 
-  // 串口连接状态（服务器在接入时同步一次，之后状态翻转会主动推送）
+  // 链路连接状态（服务器在接入时同步一次，之后状态翻转会主动推送）
   var serialDot = document.getElementById("serial-dot");
   var serialText = document.getElementById("serial-text");
+  // 链路类型决定这一行怎么称呼自己："serial" 模式下它就是串口，
+  // "network" 模式下它是到 MeArm-3D 的 TCP 链路。caps 在接入时先到。
+  var linkLabel = "串口";
+  ArmWS.on("caps", function (caps) {
+    linkLabel = (caps && caps.mode === "network") ? "链路" : "串口";
+    var dev = document.getElementById("net-device");
+    if (dev && caps && caps.mode === "network") dev.textContent = "MeArm-3D";
+  });
+
   // 三态：未连接(red) / 已连接通讯正常(green) / 已连接但通讯失败(amber)
   function setSerial(connected, errMsg, commErr, commErrMsg) {
     serialText.classList.remove("warn");
     if (!connected) {
       serialDot.className = "dot off";
       var reason = errMsg ? "（" + errMsg + "）" : "（重连中…）";
-      serialText.textContent = "串口: 未连接" + reason;
+      serialText.textContent = linkLabel + ": 未连接" + reason;
       serialText.classList.add("warn");
       return;
     }
     if (commErr) {
       serialDot.className = "dot comm";
-      serialText.textContent = "串口: 通讯失败" + (commErrMsg ? "（" + commErrMsg + "）" : "");
+      serialText.textContent = linkLabel + ": 通讯失败" + (commErrMsg ? "（" + commErrMsg + "）" : "");
       serialText.classList.add("warn");
       return;
     }
     serialDot.className = "dot on";
-    serialText.textContent = "串口: 已连接 · 通讯正常";
+    serialText.textContent = linkLabel + ": 已连接 · 通讯正常";
   }
-  ArmWS.on("serial_status", function (data) {
+  ArmWS.on("link_status", function (data) {
     var connected = !!(data && data.connected);
     var errMsg = data && data.serial_err ? data.serial_err : "";
     var commErr = !!(data && data.comm_err);
     var commErrMsg = data && data.comm_err_msg ? data.comm_err_msg : "";
     setSerial(connected, errMsg, commErr, commErrMsg);
     if (commErr) appendLine("[通讯] 失败: " + commErrMsg, true);
-    else if (!connected && errMsg) appendLine("[串口] 未连接: " + errMsg, true);
+    else if (!connected && errMsg) appendLine("[" + linkLabel + "] 未连接: " + errMsg, true);
   });
 
   // 串口文本（服务器启动时打印，浏览器端仅展示连接状态；具体由回显体现）

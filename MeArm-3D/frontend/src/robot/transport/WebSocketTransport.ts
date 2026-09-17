@@ -43,6 +43,7 @@ import { SOCKET_OPEN, webSocketFactory, type SocketFactory, type SocketLike } fr
 import { realTimer, type TimerLike } from './timer';
 import {
   ORIGIN_DEVICE,
+  ORIGIN_EXTERNAL,
   SERVER_DEVICE_STATUS,
   SERVER_ERROR,
   SERVER_HELLO,
@@ -414,10 +415,19 @@ export class WebSocketTransport implements RobotTransport {
     if (!joints || typeof joints !== 'object') return;
     this.counters.received += 1;
     this.lastState = { ...joints };
-    // ★ 来源只认**明确标注为 device** 的那一种，其余（含未知取值）一律按 command 处理。
-    //   宁可少跟随，也不要因为一个拼错的字符串把命令侧交给设备拖着走 ——
+    // ★ 来源只认**明确标注**的那两种：`device`（设备侧自主变化）与
+    //   `external`（另一台上位机经外部入口下命令）。其余（含未知取值）一律按
+    //   command 处理 —— 宁可少跟随，也不要因为一个拼错的字符串把命令侧交给别人拖着走：
     //   跟随的代价是命令侧被改写，判错方向比不跟随危险得多。
-    const origin = env.origin === ORIGIN_DEVICE ? ('device' as const) : undefined;
+    //
+    //   ⚠️ 这一层是**白名单**：后端新增来源时，若只改了 `transportBridge` 而漏了这里，
+    //      表现就是"后端标了、页面却没跟随"，而两端各自看代码都像是对的。
+    const origin =
+      env.origin === ORIGIN_DEVICE
+        ? ('device' as const)
+        : env.origin === ORIGIN_EXTERNAL
+          ? ('external' as const)
+          : undefined;
     const state = createRobotState(
       joints,
       endEffectorPose(this.model, joints),

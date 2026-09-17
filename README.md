@@ -67,14 +67,14 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
         │  MeArm-3D  · 数字孪生          │        │  MeArm-RemoteControl · 遥控台   │
         │  React 19 + Three.js           │        │  Go + 内嵌 Web（three.js 双摇杆）│
         │  关节级：滑杆 / XYZ / 拖动 / 示教│        │  舵机级：归一化摇杆帧            │
-        │  :8090 (/ws/joint)  :5273 dev  │        │  :8080 (WebSocket)  :9001 (TCP) │
+        │  :8090 (/ws/joint)  :5273 dev  │        │  :9001 (WS)  :9002 (TCP)        │
         └────────────────┬──────────────┘        └────────────────┬──────────────┘
                          │ WebSocket（JSON，关节级）                │ WebSocket（JSON，摇杆帧）
                          ▼                                        ▼
         ┌──────────────────────────────────┐      ┌──────────────────────────────┐
         │  MeArm-3D/backend （Go 1.21）      │      │  arm-web （Go 1.21）          │
         │  device：sim │ serial │ mujoco    │      │  serial ➜ hub ➜ tcp/web       │
-        │  ACK 门控 · latest-wins · 标定核对 │      │  ACK 门控 · latest-wins       │
+        │  ACK 门控 · latest-wins · 标定核对 │      │  或 netlink ➜ TCP Client       │
         └────────────────┬─────────────────┘      └──────────────┬───────────────┘
                          │ 串口 115200 8N1                          │ 串口 115200 8N1
                          └──────────────────┬───────────────────────┘
@@ -89,7 +89,17 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
                           ⚠️ 以上是**固件命名**；运动学角色见 §6.3（S9 底座 / S7 肩 / S8 肘 / S6 夹取）
 ```
 
-- **8080 与 8090 刻意错开** ⇒ 两套前端可同时运行。
+除上面这条"两条串口"路径外，遥控台**默认走第三条路径**（`start.bat` 的默认模式，
+不打开串口）—— 它作为 TCP Client 接入 MeArm-3D 的 TCP 控制接口，由 MeArm-3D
+决定把命令交给 Sim 还是 Real：
+
+```
+ 浏览器 ──WS(摇杆帧)──▶ arm-web ──TCP Client(JSON Lines)──▶ MeArm-3D tcpserver :9100
+                                                             └─▶ Controller ─▶ device: sim / real
+```
+
+- **9001（遥控台 Web）与 8090（数字孪生前端）刻意错开** ⇒ 两套前端可同时运行；
+  遥控台自己的串口透传用 **9002**，MeArm-3D 的 TCP 控制接口用 **9100**，三者互不相干。
 - 两条路径最终都归一化为**同一套文本指令**下发固件，因此行为完全一致。
 - MuJoCo 物理仿真作为 `device` 接口的**第三实现**（`sim | serial | mujoco`）接入，
   协议层 / WebSocket / controller / 前端**全部零改动**。
@@ -105,7 +115,7 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 | 子项目 | 角色 | 技术栈 | 状态 |
 |---|---|---|---|
 | [**MeArm-Device**](MeArm-Device) | ATmega328P 裸机固件 | C/C++ · avr-libc · 直接寄存器 · PlatformIO(工具链) · avrdude | ✅ 零警告，指令回归 67/67 |
-| [**MeArm-RemoteControl**](MeArm-RemoteControl) | 串口 → Web / TCP 网关 | Go 1.21 标准库 · `//go:embed` · RFC6455 · 内嵌 three.js 前端 | ✅ 门控 ~13ms，端到端 ~10ms |
+| [**MeArm-RemoteControl**](MeArm-RemoteControl) | 串口 / TCP → Web 网关（双传输模式） | Go 1.21 标准库 · `//go:embed` · RFC6455 · 内嵌 three.js 前端 | ✅ 门控 ~13ms，端到端 ~10ms；网络模式 Sim2Sim 30/30 |
 | [**MeArm-3D**](MeArm-3D) | 数字孪生 + 关节级后端 + 物理仿真 | React 19 · TS · Vite · Three.js(R3F) · Zustand · Go 1.21 · MuJoCo 3.13 · URDF/STEP | ✅ Phase 1–14 + M1–M10 + 包化重构 Phase 0–2 |
 
 ### 3.1 MeArm-Device · 裸机 AVR 固件
@@ -137,19 +147,32 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
   高波特率下丢字节；改为入队即返回后，连续指令不再丢。
 - 上位机回归：`python tools/host_verify.py COM4 115200` → **67/67 PASS**。
 
-### 3.2 MeArm-RemoteControl · 串口 → Web / TCP 网关（`arm-web`）
+### 3.2 MeArm-RemoteControl · 串口 / TCP → Web 网关（`arm-web`）
 
-- **串口层**：纯标准库实现（Windows 走 `syscall` 直连 kernel32，Linux/macOS 走 `stty`）。
-  自动重连、**ACK 门控**（同一时刻仅 1 条在途）、**连接静默窗口 + 暖机包**
-  （等 Uno bootloader 交权，吞掉首包再下发真指令）。
-- **TCP 转发**：局域网设备 raw TCP 连接后可直接下发固件指令，为远程控制预留统一接口。
-- **Web 控制台**：Three.js **双 3D 摇杆**（左：底座 + 左舵；右：夹取 + 右舵）、
+**双传输模式**（`start.bat` 默认 network、`--real` 走串口；见其 README）：
+
+- **串口模式（serial）** —— 原有路径，行为逐字节不变：
+  - **串口层**：纯标准库实现（Windows 走 `syscall` 直连 kernel32，Linux/macOS 走 `stty`）。
+    自动重连、**ACK 门控**（同一时刻仅 1 条在途）、**连接静默窗口 + 暖机包**
+    （等 Uno bootloader 交权，吞掉首包再下发真指令）。
+  - **TCP 转发**：局域网设备 raw TCP 连接后可直接下发固件指令，为远程控制预留统一接口。
+- **网络模式（network）** —— 作为 **TCP Client** 连 [MeArm-3D 的 TCP 控制接口](MeArm-3D/docs/tcp-control-v1.md)
+  （JSON Lines，`:9100`），把网页意图翻译成对方已有的 `servo` / `move` / `gripper` / `state` 命令：
+  - **单一写泵**：所有写只在一个 goroutine 里，同一连接上 JSON 不可能交叉；
+    摇杆按舵机维度 latest-wins、离散命令走有界 FIFO（满则丢最旧）。
+  - **时间驱动的角度积分**：摇杆增量 = 速度 × 真实 dt ⇒ 前端发送频率不影响速度。
+  - **越界即回滚**：服务端拒绝某轴时本地目标回滚到确认值（否则该轴"推杆完全不动"且不报错）。
+  - **刻意不做**：IK / FK / 坐标变换 / 标定换算 / 软限位 / Sim·Real 选择 —— 全归 MeArm-3D。
+- **Web 控制台**（两模式共用同一份页面，能力差异由 WS `caps` 告知）：
+  Three.js **双 3D 摇杆**（左：底座 + 左舵；右：夹取 + 右舵）、
   **动作死区 5°**（四轴全居中 ⇒ 整帧不发，串口零流量）、按住偏转 **30 ms 心跳持续步进**、
-  S6–S9 角度面板（从所有含角度的应答**合并更新**）、**30 行滑动窗口**回显终端。
+  S6–S9 角度面板（从所有含角度的应答**合并更新**）、**30 行滑动窗口**回显终端；
+  网络模式另开 **XYZ 步进 / 爪 open·close / 四舵机滑条 + TCP 末端坐标回读**面板。
 - **性能根治**：Windows 非重叠 I/O 读写互斥曾导致每条命令 218–932 ms、丢帧 75%；
   改用「立即返回」读模式 + 手动行缓冲（弃用 `bufio`，同时修掉空闲 20 s 必断连）
   ⇒ **门控单条周期 ~13 ms · WebSocket 端到端 ~10 ms**。
-- 端口：**8080**（Web / WebSocket）· **9001**（TCP）· 均可在 YAML 配置。
+- 端口：**9001**（Web / WebSocket）· **9002**（TCP 透传，仅串口模式）· 目标侧 **9100**（MeArm-3D TCP）·
+  均可在 YAML 配置。
 
 ### 3.3 MeArm-3D · 数字孪生 + 关节级后端 + 物理仿真
 
@@ -209,8 +232,10 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 | 硬件摇杆（ADC） | ✅ | — | — |
 | 红外遥控（NEC）+ 按键学习 | ✅ | — | — |
 | 红外动作序列（4 套） | ✅ | ✅（可下发） | — |
-| 以太网 / TCP 透传 | — | ✅ | — |
+| 局域网 TCP 透传（文本指令，仅串口模式） | — | ✅ | — |
+| 关节级 TCP 控制接口（JSON Lines） | — | ✅（Client） | ✅（Server） |
 | Web 3D 摇杆（舵机级） | — | ✅ | — |
+| 末端 XYZ 步进 / 爪开合 / 舵机滑条面板 | — | ✅（网络模式） | — |
 | 数字孪生（关节级） | — | — | ✅ |
 | FK / IK | — | — | ✅ |
 | 鼠标拖拽末端 | — | — | ✅ |
@@ -252,13 +277,14 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 |---|---|---|
 | MeArm-Device | 裸机固件（PWM / 时基 / 串口 / 摇杆 / 红外 / 序列 / EEPROM） | ✅ 零警告 · 67/67 PASS |
 | MeArm-RemoteControl | 串口网关 · ACK 门控 · TCP 透传 · Web 双 3D 摇杆 | ✅ 端到端 ~10 ms |
+| MeArm-RemoteControl | TCP 接入 MeArm-3D（network 模式 · `start.bat` · XYZ/爪/舵机面板 · 只读 `state` 基准 · 对端页面跟随 `origin=external`） | ✅ Sim2Sim 30/30 |
 | MeArm-3D | Phase 1–14（模型 / 3D / FK / IK / 拖动 / Mock / Go WS / 真串口 / 反馈 / 幽灵 / 示教 / 被动腕） | ✅ |
 | MeArm-3D | MuJoCo 物理轨 M1–M10 | ✅ |
 | MeArm-3D | 照片纹理贴图（D63 / D64 / D66 / D68 / D69） | ✅ |
 | MeArm-3D | Robot Package 重构 Phase 0–2（只读分析 / Core 边界 / 真值·工具·实现·测试随包走） | ✅ |
 | MeArm-3D | 3D 结构（STEP）接入 + 标准 URDF 生成链 | ✅ 产物入库 · 测试盯同步 |
 | MeArm-3D | 末端目标安全参数改版（删限位调节 / 加球壳外径覆写 / 修 d 口径不一致） | ✅ |
-| MeArm-3D | ADR 决策记录 D1–D80 | ✅ 77 条 |
+| MeArm-3D | ADR 决策记录 D1–D83 | ✅ 80 条 |
 
 ### 6.2 验收数据（可复现）
 
@@ -266,8 +292,8 @@ MeArmPilot 是一台 **meArm 型 4 自由度舵机机械臂**的完整开源实�
 
 ```
 类型检查      tsc -b                        0 error
-单元/验收测试  vitest run                   434 / 434 PASS（33 文件）
-后端单测      go test ./...                 76 PASS（5 包）+ go vet 干净
+单元/验收测试  vitest run                   439 / 439 PASS（33 文件）
+后端单测      go test ./...                 111 PASS + go vet 干净
 浏览器 e2e    node tests/e2e/ui-smoke.mjs   87 / 88 PASS（1 项为测试时序问题，见下注）
 仓库 Python   pytest -q（仓库根）            198 PASS（core/tests 31 · tests 160 · robot-package 7）
   其中仿真轨   pytest tests/sim              151 PASS（13 文件）
@@ -303,9 +329,20 @@ RAM                                          844 B（.data 138 + .bss 706）/ 2 
 
 ```
 静态检查      go vet ./...                  干净
+单元测试      go test ./...                 39 PASS（含 -race 干净）
+网络模式 e2e  node tools/sim2sim-check.mjs  30 / 30 PASS（Sim2Sim，期望值从 config.yaml + robot.yaml 派生）
 门控性能      ACK 门控单条周期                ~13 ms（改造前 218–932 ms）
 端到端        浏览器 → 服务器 → 串口           ~10 ms
 受控流        50 ms 节奏连续 JOY              40 / 40 全部下发
+```
+
+**跨项目（TCP 接入）**
+
+```
+MeArm-3D TCP 只读 state 命令  go test ./internal/tcpserver/   新增用例 PASS（只读性 + 反映最新命令 + 大小写不敏感）
+两模式方向等价性              main_test.go 护栏              满偏 dt=1s 的增量符号 > 0（与串口同向）
+端到端 Sim2Sim                arm-web(network) ⇄ MeArm-3D(sim)  30 / 30 PASS
+真机验证                      未做                             ⚠️ 见 §9
 ```
 
 ### 6.3 关键结论（实测推翻假设）
@@ -330,6 +367,12 @@ RAM                                          844 B（.data 138 + .bss 706）/ 2 
   UI 上 1–160 是**几何球壳**的范围，而关节限位把它裁到实际有效域 **`d ∈ [44.17, 139.27]`**。
 - **几何真值来自 3D 装配体（STEP）**：未知尺寸由 OCCT 解析装配体反解，
   而非按照片目测；STEP 解析一律用参考实现，不写自研解析器。
+- **同一条"推杆方向"在两条链路上不是同一个意思**：串口链路的 `invert_*` 里含一层
+  **arm-device 固件方向补偿**（`core/joystick.c`：8 轴出厂即反相，9/6/7 轴 `raw>800 → 负步长`），
+  而 TCP 链路**没有固件层**。直接把配置搬过去，会让两种模式的推杆方向**正好相反**
+  （实测同一满偏输入：串口 +90°/s、TCP −90°/s），且两边都"看起来正常工作"。
+  修法不是改配置，而是加一次显式换算（`NetInvertFor`），并用
+  「满偏 dt=1s 的增量符号必须为正」写成护栏测试。
 
 ---
 
@@ -374,13 +417,32 @@ python MeArm-3D/simulation/mujoco/server.py
 # 前端零改动连上即可；hello.simulation_mode = "mujoco"
 ```
 
-### 7.5 串口网关（摇杆级遥控台）
+### 7.5 遥控台（舵机级摇杆台，串口 / 网络双模式）
 
-```bash
+**默认：网络模式** —— 先把 MeArm-3D 起起来（见 §7.1 / §7.2，Sim 即可），再：
+
+```bat
 cd MeArm-RemoteControl
-build.bat            # Windows；Linux/macOS 用 bash build.sh 或 make
-arm-web.exe -c config.yaml
-# 浏览器 http://127.0.0.1:8080    局域网 telnet <IP> 9001
+start.bat            # 默认 network：不打开串口，TCP Client 连 MeArm-3D(:9100)
+# 浏览器 http://127.0.0.1:9001
+```
+
+**串口模式**（驱动真机，机械臂会动）：
+
+```bat
+cd MeArm-RemoteControl
+start.bat --real     # 等价 --serial：打开串口走 arm-device 协议
+# 浏览器 http://127.0.0.1:9001    串口模式下另开局域网透传 telnet <IP> 9002
+```
+
+`start.bat` 会自动在源码比二进制新时重建（未知参数报错退出，`--help` 看用法）。
+只想编译不动模式：`build.bat`（Windows）/ `bash build.sh` / `make`。
+
+端到端自检（不需要浏览器）：
+
+```bat
+node tools/e2e-sim.js           # 串口模式：摇杆帧 / 死区零流量 / 角度解析 / TCP 转发
+node tools/sim2sim-check.mjs    # 网络模式：30 项断言（Sim2Sim）
 ```
 
 ### 7.6 校验机器人包 / 重新生成产物
@@ -408,10 +470,13 @@ MeArmPilot/
 │   ├── bsp/                      #    硬件驱动（uart / servo / led / adc / ir / eeprom / systick）
 │   ├── core/                     #    应用（arm_control / cmd / joystick / ir_ctrl / ir_seq / main）
 │   └── tools/                    #    host_verify.py（上位机指令回归）+ NEC 解码单测
-├── MeArm-RemoteControl/          # ② 串口 → Web / TCP 网关
+├── MeArm-RemoteControl/          # ② 串口 / TCP → Web 网关（默认 network，--real 走串口）
+│   ├── start.bat                 #    一键启动：选模式（默认 network / --real 串口 / --help）
 │   ├── internal/                 #    config / protocol / serial / hub / tcp / web
-│   ├── web/static/               #    内嵌前端（three.js 双摇杆 + 角度面板 + 回显终端）
-│   └── tools/                    #    e2e-sim.js · tcp-test.js · headless-joystick-test.js
+│   │                             #    + netlink（TCP Client：单写泵 · latest-wins · 退避重连）
+│   │                             #    + link（Link 抽象：serialLink / netLink 两实现）
+│   ├── web/static/               #    内嵌前端（three.js 双摇杆 + 角度面板 + 回显终端 + 网络面板）
+│   └── tools/                    #    e2e-sim.js · tcp-test.js · sim2sim-check.mjs · headless-joystick-test.js
 └── MeArm-3D/                     # ③ 数字孪生 + 关节级后端 + 物理仿真
     ├── config/                   # robots.yaml —— 只放「选择器指针」（默认机器人 id + 文件路径）
     ├── robot-package/            # ★ 每台机器人一个包：真值 / 运动学 / 物理 / 测试 / 工具 / URDF
@@ -456,6 +521,14 @@ MeArmPilot/
   `d ∈ [44.17, 139.27]`，所以外径填 150 / 160 **等于没有覆写**。
 - **肩标定增益偏差 −13.1% 未解决**，且跨批测量不可复现（详见 §6.3）；
   夹爪标定方向已于 D80 依真机实测修正。
+- **遥控台的网络模式只在 Sim 上验证过**：`arm-web(network) ⇄ MeArm-3D(sim)` 端到端 30/30；
+  `MeArm-3D --real`（真机）+ network 模式、以及网络模式下的真机串口链路**未做真机验证**。
+  串口模式（`start.bat --real`）的既有结论不受影响，但本次也**未接真机复测**。
+  > 对端页面的表现已单独验证（2026-09-17）：`arm-web` 驱动时 MeArm-3D 页面**主臂与幽灵一起动**
+  > （`|tcp − actualTcp| = 0.000 mm`，渲染侧两棵树 TCP 世界坐标重合 0.000 mm）。
+  > 修复记录见 `MeArm-3D/docs/decisions.md` **D84**；判据脚本
+  > `MeArm-3D/frontend/tests/e2e/external-origin-follow.mjs`（**9/9**）与
+  > `MeArm-3D/core/tools/verify_external_origin.mjs`（**3/3**）。
 
 ---
 
@@ -476,10 +549,11 @@ MeArmPilot/
 | 末端目标安全参数（球壳内/外径、容差） | [`MeArm-3D/docs/target-guard-analysis.md`](MeArm-3D/docs/target-guard-analysis.md) |
 | 工作空间边界实测（有效域怎么量出来的） | [`MeArm-3D/docs/workspace-boundary.md`](MeArm-3D/docs/workspace-boundary.md) |
 | 真机实测记录与不确定度 | [`MeArm-3D/docs/hardware-measurement.md`](MeArm-3D/docs/hardware-measurement.md) |
-| 设计决策 ADR（D1–D80） | [`MeArm-3D/docs/decisions.md`](MeArm-3D/docs/decisions.md) |
+| 设计决策 ADR（D1–D83） | [`MeArm-3D/docs/decisions.md`](MeArm-3D/docs/decisions.md) |
 | 物理仿真怎么跑 / 判据纪律 | [`MeArm-3D/simulation/README.md`](MeArm-3D/simulation/README.md) |
 | 物理量真值（质量 / 摩擦 / 惯量） | [`MeArm-3D/robot-package/mearm-v1/physics/physics.yaml`](MeArm-3D/robot-package/mearm-v1/physics/physics.yaml) |
 | 串口 / WS 协议基线 | [`MeArm-3D/docs/serial-v1.md`](MeArm-3D/docs/serial-v1.md) |
+| TCP 控制协议基线（JSON Lines：`move`/`gripper`/`servo`/`state`） | [`MeArm-3D/docs/tcp-control-v1.md`](MeArm-3D/docs/tcp-control-v1.md) |
 | 图像采集指南 | [`MeArm-3D/docs/texture-capture-guide.md`](MeArm-3D/docs/texture-capture-guide.md) |
 | 开发提示词记录 | [`docs/`](docs) |
 

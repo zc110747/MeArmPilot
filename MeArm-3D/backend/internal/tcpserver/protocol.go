@@ -4,16 +4,39 @@ package tcpserver
 //
 // ## 本包**只做协议转换**，不做控制
 //
-//	TCP JSON  →  校验参数  →  调用现有 controller.Apply（关节角整帧）
+//	TCP JSON  →  校验参数  →  调用现有 controller.ApplyFrom（关节角整帧 + 来源）
 //
 // 这里**没有**、也不允许出现：IK / FK 算法、舵机运动学、软限位逻辑、
 // Sim / Real / Serial 的任何分支判断。切换 `device.mode` 不影响本文件一个字。
+//
+// ## 三条写命令一律声明来源 `protocol.OriginExternal`
+//
+// TCP 客户端是**另一个进程**（如 MeArm-RemoteControl）。它的命令会经
+// controller 广播给 MeArm-3D 自己的页面，而那台页面靠帧上的 `origin` 决定
+// "要不要让指令侧跟随"：`command` = "本页自己发的，实际位姿在追" ⇒ 只更新 Actual；
+// 外部驱动必须让它**跟随**（否则画面上只有半透明的实际臂在动、主臂不动，
+// 且那台页面的指令侧停在旧值，用户下次动本页控件会把整组旧指令下发）。
+// 所以这里用 `ApplyFrom` 显式声明来源，而不是图省事借用 `Apply`。
 //
 // 三条命令（v1 刻意最小化）：
 //
 //	move     XYZ 相对位移 → 当前位姿(FK) → 目标点 → IK → 关节角 → Apply
 //	gripper  open / close → 取该关节限位的端点 → Apply
 //	servo    1..4 直接给舵机角 → 舵机硬件限位校验 → 舵机角转关节角 → Apply
+//
+// 外加一条**只读**命令（v1.1 补，见 docs/tcp-control-v1.md §3.4）：
+//
+//	state    无参数、无副作用 → 直接回当前 state → 不调用 Apply
+//
+// 为什么必须有它：上面前三条**全是写命令**。任何外部控制器（如
+// MeArm-RemoteControl）在"首次下发前"都拿不到当前舵机角 —— 而舵机级控制是
+// 绝对角语义（`servo` 要目标角），没有基准就只能猜，猜错的第一帧就是一次跳变。
+// 它也兑现了 §13「状态反馈优先复用服务端真值」的要求：不新增状态系统，
+// 只是把现成的 `state()` 暴露成一个入口。
+//
+// ⚠️ `state` **不持 h.mu**：加锁会让一次只读查询挡在别人的"读当前→算目标→下发"
+//    中间。而 `Snapshot()` 本身在 controller 内已加锁、返回的是**拷贝**，
+//    读到的必然是一个自洽的目标帧，不会看到半更新的 map。
 //
 // ## 限位与校验一律复用模型真值
 //
@@ -28,6 +51,7 @@ import (
 	"strings"
 	"sync"
 
+	"armpilot/backend/internal/protocol"
 	"armpilot/backend/internal/robot"
 )
 
@@ -36,8 +60,14 @@ import (
 // 刻意只留这四个方法：接口越窄，越难在 TCP 层长出自己的控制逻辑。
 // `*controller.Controller` 天然满足它（main.go 直接传即可）。
 type Arm interface {
-	// Apply 下发关节角整帧（内部做限位校验 + ACK 门控 + latest-wins）
+	// Apply 下发关节角整帧（内部做限位校验 + ACK 门控 + latest-wins）。
 	Apply(joints map[string]float64) error
+	// ApplyFrom 同上，但**声明来源**（`protocol.Origin*`）。
+	//
+	// 外部入口必须走这一个：借 `Apply`（= `OriginCommand`）会让对端页面把它当成
+	// "本页自己发的命令"，只更新 Actual ⇒ 画面上**实际臂在动、主臂不动**，
+	// 且那台页面的指令侧停在旧值（下一次动本页控件会把整组旧指令下发）。
+	ApplyFrom(origin string, joints map[string]float64) error
 	// Snapshot 取当前命令值与状态值
 	Snapshot() (command, state map[string]float64)
 	DeviceKind() string
@@ -113,6 +143,12 @@ func (h *Handler) Execute(line string) Result {
 	return h.dispatch(c)
 }
 
+// dispatch 分发一条命令。
+//
+// ⚠️ 三条**写**命令（move / gripper / servo）一律以 `protocol.OriginExternal` 下发 ——
+// 它们来自**另一个进程**，对端页面必须"跟随"（写指令侧 + 抑制回发），
+// 而不是把它们当成"本页自己发的命令"（那样只更新 Actual，画面显示错、且指令侧滞留旧值）。
+// `state` 是只读查询，不碰 Apply，因此不需要来源。
 func (h *Handler) dispatch(c Command) Result {
 	cmd := strings.ToLower(strings.TrimSpace(c.Cmd))
 	switch cmd {
@@ -124,9 +160,25 @@ func (h *Handler) dispatch(c Command) Result {
 		return h.gripper(c)
 	case "servo":
 		return h.servo(c)
+	case "state":
+		// 只读：不碰 Apply、不碰 device，因此不需要 h.mu（见文件头注释）。
+		return h.readState()
 	default:
 		return Result{OK: false, Cmd: cmd, Error: fmt.Sprintf("unknown cmd %q", c.Cmd)}
 	}
+}
+
+// readState 回当前状态，供外部控制器建立基准 / 同步界面。
+//
+// 唯一可能与"没状态"撞上的时刻是 `controller.Snapshot()` 返回空 map —— 实际
+// 不可达（`controller.New` 把 lastCommand 初始化为 HomePose），但仍要给出可读的
+// 错误而不是 `ok:true` 配一个空 state：调用方据此区分"状态还没准备好"与"读到了"。
+func (h *Handler) readState() Result {
+	st := h.state()
+	if st == nil {
+		return Result{OK: false, Cmd: "state", Error: "no state available yet"}
+	}
+	return Result{OK: true, Cmd: "state", State: st}
 }
 
 // move XYZ 相对位移。
@@ -179,7 +231,7 @@ func (h *Handler) move(c Command) Result {
 		// 原因透传（OUT_OF_WORKSPACE / JOINT_LIMIT），调用方据此分支。
 		return Result{OK: false, Cmd: "move", Error: ierr.Reason + ": " + ierr.Message}
 	}
-	if err := h.arm.Apply(sol); err != nil {
+	if err := h.arm.ApplyFrom(protocol.OriginExternal, sol); err != nil {
 		return Result{OK: false, Cmd: "move", Error: err.Error()}
 	}
 	return h.ok("move")
@@ -209,7 +261,7 @@ func (h *Handler) gripper(c Command) Result {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.arm.Apply(map[string]float64{jointID: v}); err != nil {
+	if err := h.arm.ApplyFrom(protocol.OriginExternal, map[string]float64{jointID: v}); err != nil {
 		return Result{OK: false, Cmd: "gripper", Error: err.Error()}
 	}
 	return h.ok("gripper")
@@ -258,7 +310,7 @@ func (h *Handler) servo(c Command) Result {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.arm.Apply(map[string]float64{jointID: theta}); err != nil {
+	if err := h.arm.ApplyFrom(protocol.OriginExternal, map[string]float64{jointID: theta}); err != nil {
 		return Result{OK: false, Cmd: "servo", Error: err.Error()}
 	}
 	return h.ok("servo")

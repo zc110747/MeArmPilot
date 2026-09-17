@@ -8,11 +8,13 @@ package tcpserver
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
 	"testing"
 
+	"armpilot/backend/internal/protocol"
 	"armpilot/backend/internal/robot"
 )
 
@@ -24,6 +26,8 @@ type fakeArm struct {
 	mu      sync.Mutex
 	last    map[string]float64
 	applied []map[string]float64
+	// origins 与 applied 一一对应：记录每条命令的来源（`protocol.Origin*`）。
+	origins []string
 	err     error
 	kind    string
 }
@@ -37,6 +41,10 @@ func newFakeArm(m *robot.Model) *fakeArm {
 }
 
 func (f *fakeArm) Apply(joints map[string]float64) error {
+	return f.ApplyFrom(protocol.OriginCommand, joints)
+}
+
+func (f *fakeArm) ApplyFrom(origin string, joints map[string]float64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
@@ -55,6 +63,7 @@ func (f *fakeArm) Apply(joints map[string]float64) error {
 		cp[k] = v
 	}
 	f.applied = append(f.applied, cp)
+	f.origins = append(f.origins, origin)
 	return nil
 }
 
@@ -78,6 +87,16 @@ func (f *fakeArm) lastApplied() map[string]float64 {
 		return nil
 	}
 	return f.applied[len(f.applied)-1]
+}
+
+// lastOrigin 返回最近一条命令的来源；没有任何命令时返回空串。
+func (f *fakeArm) lastOrigin() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.origins) == 0 {
+		return ""
+	}
+	return f.origins[len(f.origins)-1]
 }
 
 func newFixture(t *testing.T) (*Handler, *fakeArm, *robot.Model, robot.Geom) {
@@ -346,6 +365,118 @@ func TestHandler_SerializesConcurrentCommands(t *testing.T) {
 	if d := math.Abs(got.X - (before.X + float64(n)*step)); d > 1e-6 {
 		t.Errorf("并发 %d 次 +%.1f 后 X = %.4f，期望 %.4f（差 %.3e ⇒ 有步被并发吃掉）",
 			n, step, got.X, before.X+float64(n)*step, d)
+	}
+}
+
+// TestState_ReadOnlyAndReflectsCurrentCommand §3.4：`state` 必须**只读**，
+// 且返回的是当前**命令值**（与 `move` 的基准同源），不是设备过程值。
+//
+// 这条命令存在的唯一理由是让外部控制器（MeArm-RemoteControl）能在**下发任何
+// 东西之前**拿到基准。所以"它自己绝不下发"是硬约束，不是风格问题。
+func TestState_ReadOnlyAndReflectsCurrentCommand(t *testing.T) {
+	h, arm, m, _ := newFixture(t)
+
+	// ① 只读性：第一次调用不得产生任何 Apply。
+	first := h.Execute(`{"cmd":"state"}`)
+	if !first.OK {
+		t.Fatalf("state 应当成功，实际 error=%q", first.Error)
+	}
+	if len(arm.applied) != 0 {
+		t.Fatalf("state 不得下发任何命令，实际 applied=%v", arm.applied)
+	}
+	if first.State == nil {
+		t.Fatal("state 必须携带 state 字段")
+	}
+
+	// ② 初始基准 = HOME 位经标定换算的舵机角。
+	//    期望值**从模型派生**（HomePose + Actuator），不写常数 —— 见文件头约定。
+	wantHome := make([]float64, 0, len(m.JointOrder()))
+	for _, id := range m.JointOrder() {
+		acts := m.ActuatorsForJoint(id)
+		if len(acts) == 0 {
+			continue
+		}
+		wantHome = append(wantHome, robot.JointToServo(acts[0], m.HomePose[id]))
+	}
+	if len(first.State.Servo) != len(wantHome) {
+		t.Fatalf("servo 长度 = %d，期望 %d（= 有执行器的关节数）", len(first.State.Servo), len(wantHome))
+	}
+	for i := range wantHome {
+		if d := math.Abs(first.State.Servo[i] - wantHome[i]); d > 1e-9 {
+			t.Errorf("servo[%d] = %.6f，期望 HOME 换算值 %.6f", i+1, first.State.Servo[i], wantHome[i])
+		}
+	}
+	if first.State.Device != arm.kind {
+		t.Errorf("device = %q，期望 %q", first.State.Device, arm.kind)
+	}
+	if len(first.State.TCP) != 3 {
+		t.Errorf("tcp 应为 [x,y,z]，实际 %v", first.State.TCP)
+	}
+
+	// ③ 下发一条 servo 之后，state 必须反映**新命令值**（而不是停在 HOME）。
+	const target = 120.0 // base 的舵机行程 30..150 之内（真值是 robot.yaml 的 limits）
+	if got := h.Execute(`{"cmd":"servo","servo":1,"angle":120}`); !got.OK {
+		t.Fatalf("servo 下发失败: %q", got.Error)
+	}
+	after := h.Execute(`{"cmd":"state"}`)
+	if !after.OK || after.State == nil {
+		t.Fatalf("第二次 state 失败: ok=%v error=%q", after.OK, after.Error)
+	}
+	if d := math.Abs(after.State.Servo[0] - target); d > 1e-6 {
+		t.Errorf("servo 1 = %.6f，期望 %.1f（差 %.3e）", after.State.Servo[0], target, d)
+	}
+	if len(arm.applied) != 1 {
+		t.Errorf("applied 次数 = %d，期望 1 —— state 不得自己下发", len(arm.applied))
+	}
+
+	// ④ cmd 大小写不敏感，与其它命令一致。
+	if got := h.Execute(`{"cmd":"STATE"}`); !got.OK {
+		t.Errorf("cmd 应大小写不敏感，实际 error=%q", got.Error)
+	}
+}
+
+// TestWriteCommands_CarryExternalOrigin 外部入口下发的**写**命令必须声明来源。
+//
+// 为什么值得单独立一条：来源若借用 `OriginCommand`，对端页面会把这些命令当成
+// "本页自己发的"，于是只更新 Actual —— 画面上表现为**半透明实际臂在动、主臂不动**，
+// 而且那台页面的指令侧停在旧值（用户下一次动本页控件会把整组旧指令下发）。
+// 这类缺陷在"命令有没有被受理"的用例里**完全看不见**（受理永远成功），
+// 所以判据只能是**来源本身**。
+func TestWriteCommands_CarryExternalOrigin(t *testing.T) {
+	h, arm, m, _ := newFixture(t)
+	order := m.JointOrder()
+	acts := m.ActuatorsForJoint(order[0])
+	if len(acts) == 0 {
+		t.Fatal("首个关节没有执行器")
+	}
+	// 取舵机行程中点 —— 不挑"我记得能用"的角度（真值是 robot.yaml 的 limits）。
+	mid := (acts[0].Limits.Min + acts[0].Limits.Max) / 2
+
+	cases := []struct {
+		name string
+		line string
+	}{
+		{"move", `{"cmd":"move","axis":"x","direction":"+","step":5}`},
+		{"gripper", `{"cmd":"gripper","action":"open"}`},
+		{"servo", fmt.Sprintf(`{"cmd":"servo","servo":1,"angle":%.4f}`, mid)},
+	}
+	for _, c := range cases {
+		if got := h.Execute(c.line); !got.OK {
+			t.Fatalf("%s 下发失败: %q", c.name, got.Error)
+		}
+		if o := arm.lastOrigin(); o != protocol.OriginExternal {
+			t.Errorf("%s 的来源 = %q，期望 %q（外部入口不得借用 command）",
+				c.name, o, protocol.OriginExternal)
+		}
+	}
+
+	// 只读查询不得产生任何下发 —— 否则"来源"会记上一次并不存在的驱动事件。
+	before := len(arm.origins)
+	if got := h.Execute(`{"cmd":"state"}`); !got.OK {
+		t.Fatalf("state 失败: %q", got.Error)
+	}
+	if len(arm.origins) != before {
+		t.Errorf("state 不得下发命令，实际 origins=%v", arm.origins)
 	}
 }
 

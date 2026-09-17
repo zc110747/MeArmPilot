@@ -151,3 +151,94 @@ func TestDeadbandInverted(t *testing.T) {
 		t.Errorf("inverted inside deadband: %q", got)
 	}
 }
+
+// TestFirmwareInvertsAxis 钉住固件的方向差异表 —— 它是 NetInvertFor 的唯一输入。
+//
+// 真值：MeArm-Device/core/joystick.c 的 `bool positive = (id == 8) ? past_hi : past_lo;`
+// 谁改了固件这一行，就必须同时改 protocol.go 的 FirmwareInvertsAxis 与本测试。
+func TestFirmwareInvertsAxis(t *testing.T) {
+	for _, id := range []int{6, 7, 9} {
+		if FirmwareInvertsAxis(id) {
+			t.Errorf("id %d 在固件里是正常轴（raw<200 -> +step），不该标为反相", id)
+		}
+	}
+	if !FirmwareInvertsAxis(8) {
+		t.Errorf("id 8 在固件里是反相轴（raw>800 -> +step）")
+	}
+}
+
+// TestNetInvertFor 钉住"串口 invert_* → 网络 invert"的换算。
+//
+// 判据不是"公式长什么样"，而是**两种模式下同一个推杆动作是否让同一个舵机
+// 朝同一个方向转**：
+//
+//	串口（axisRaw 镜像 + 固件方向）：
+//	    推杆正向 s=+1 时，步长符号 =
+//	        axes 9/6/7 : inv ? +1 : -1
+//	        axis 8     : inv ? -1 : +1
+//	网络（netlink.axisSpeed 只在 inv 时取负）：
+//	    步长符号 = inv ? -1 : +1
+//
+// 本测试把上面这张表逐格算出来，要求 NetInvertFor 使其与串口侧逐格相等。
+func TestNetInvertFor(t *testing.T) {
+	// serialStepSign 复刻串口链路对 s=+1 的步长符号（-1 = 角度减小）。
+	serialStepSign := func(armServoID int, inv bool) int {
+		// axisRaw: out>0 → raw = 511+|out|*512；inv → raw = 1023-raw
+		// ⇒ P = sign(raw-512) = inv ? -1 : +1
+		p := 1
+		if inv {
+			p = -1
+		}
+		// 固件：9/6/7 是 raw<200 才正步进 ⇒ step = -P；8 轴反过来 ⇒ step = +P
+		if FirmwareInvertsAxis(armServoID) {
+			return p
+		}
+		return -p
+	}
+	// netStepSign 复刻网络链路对 s=+1 的步长符号。
+	netStepSign := func(netInv bool) int {
+		if netInv {
+			return -1
+		}
+		return 1
+	}
+
+	for _, id := range []int{6, 7, 8, 9} {
+		for _, inv := range []bool{false, true} {
+			netInv := NetInvertFor(id, inv)
+			want := serialStepSign(id, inv)
+			got := netStepSign(netInv)
+			if got != want {
+				t.Errorf("id=%d inv=%v: NetInvertFor=%v 给出步长符号 %+d，串口侧是 %+d —— 两模式方向相反",
+					id, inv, netInv, got, want)
+			}
+		}
+	}
+}
+
+// TestNetInvertFor_DefaultConfigIsAllFalse 是上面那张表在 config.yaml
+// 出厂默认值上的直接推论：四轴都应换算成 inv=false
+// （= 网络模式下"推杆正方向 → 该舵机角度增大"）。
+//
+// 哪一个不等于 false，就说明有人改了 invert 的默认值却没同步两种模式的手感。
+func TestNetInvertFor_DefaultConfigIsAllFalse(t *testing.T) {
+	// config.yaml 的 joystick 段默认值：lx_servo=9 ly_servo=8 rx_servo=6 ry_servo=7
+	//                                   invert_lx=true invert_ly=false
+	//                                   invert_rx=true invert_ry=true
+	cases := []struct {
+		name string
+		id   int
+		inv  bool
+	}{
+		{"lx_servo=9/invert_lx=true", 9, true},
+		{"ly_servo=8/invert_ly=false", 8, false},
+		{"rx_servo=6/invert_rx=true", 6, true},
+		{"ry_servo=7/invert_ry=true", 7, true},
+	}
+	for _, c := range cases {
+		if got := NetInvertFor(c.id, c.inv); got {
+			t.Errorf("%s: NetInvertFor=%v，应为 false（否则网络模式推杆方向与串口相反）",
+				c.name, got)
+		}
+	}
+}

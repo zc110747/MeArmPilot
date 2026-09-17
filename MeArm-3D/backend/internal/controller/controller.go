@@ -71,9 +71,17 @@ type Controller struct {
 	nowFn  func() time.Time
 	inited bool
 
-	mu          sync.Mutex
-	inflight    *inflight
-	pending     map[string]float64
+	mu       sync.Mutex
+	inflight *inflight
+	pending  map[string]float64
+	// pendingOrigin 与 `pending` **同行**：待发槽里那条命令是谁下的。
+	pendingOrigin string
+	// curOrigin 是"最近一次**真正发出**的命令"的来源（`protocol.Origin*`）。
+	//
+	// 为什么不从 inflight 现取：`OK JR` 一到就放行门控（`finishInflight` 清空
+	// inflight），而设备随后的 `STATE` 推进帧**仍属于刚发出的那条命令**。
+	// 把来源记在这里，整段斜坡帧才能带上正确的来源（见 handleLine 的 ReplyState）。
+	curOrigin   string
 	lastCommand map[string]float64
 	lastState   map[string]float64
 	lastSendAt  time.Time
@@ -98,6 +106,7 @@ func New(m *robot.Model, dev device.Device, cfg Config) *Controller {
 		cfg:         cfg,
 		order:       m.JointOrder(),
 		nowFn:       time.Now,
+		curOrigin:   protocol.OriginCommand,
 		lastCommand: copyJoints(m.HomePose),
 		lastState:   copyJoints(m.HomePose),
 	}
@@ -155,7 +164,10 @@ func (c *Controller) handleLine(line device.Line) {
 			return
 		}
 		joints := c.stateFromValues(reply.Joints)
-		c.publishState(joints, protocol.OriginCommand)
+		// 来源 = **最近一次真正发出的命令**的来源，即 `curOrigin`。
+		// 不能从 inflight 取：`OK JR` 已放行门控并清空了 inflight，而这批
+		// STATE 推进帧仍属于刚发出的那条命令（本页 → command，外部入口 → external）。
+		c.publishState(joints, c.commandOrigin())
 
 	case protocol.ReplyServo:
 		// 设备侧上报的**实际**舵机角 —— 说明下位机被命令之外的东西动了
@@ -220,7 +232,25 @@ func (c *Controller) mergeState(next map[string]float64) map[string]float64 {
 // Apply 受理一条关节级命令。返回的错误表示**未被受理**（可立即回报给浏览器）。
 //
 // 受理后的链路异常（回执超时 / 设备拒绝）通过 ErrorHandler 异步上报。
+//
+// 来源固定为 `protocol.OriginCommand`（本机 / 本页命令）。**外部入口不要用它** ——
+// 用 `ApplyFrom` 带上自己的来源，否则对端界面只会更新 Actual（见 `OriginExternal`）。
 func (c *Controller) Apply(joints map[string]float64) error {
+	return c.ApplyFrom(protocol.OriginCommand, joints)
+}
+
+// ApplyFrom 受理一条关节级命令，并记录它的**来源**（`protocol.Origin*`）。
+//
+// 来源随命令一路同行（`dispatch` → `send`/`pendingOrigin` → `curOrigin`），
+// 到设备回 `STATE` 时按它标注；前端据此决定"命令侧要不要跟随"。
+//
+// ⚠️ 新增入口（TCP JSON / 将来的 MQTT…）必须用自己的来源常量，不要图省事借用
+//    `OriginCommand`：借用的后果是**对端界面看起来在动、其实显示错了**，
+//    而且对方下一次操作会把整组旧指令下发（见 protocol.OriginExternal 注释）。
+func (c *Controller) ApplyFrom(origin string, joints map[string]float64) error {
+	if origin == "" {
+		origin = protocol.OriginCommand
+	}
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()
@@ -246,7 +276,7 @@ func (c *Controller) Apply(joints map[string]float64) error {
 		return &RejectError{Code: protocol.CodeJointLimit, Message: v.Error()}
 	}
 
-	return c.dispatch(full)
+	return c.dispatch(full, origin)
 }
 
 // RawLine 把一行**原始设备指令**直通给链路末端（调试 / 验收用）。
@@ -293,14 +323,15 @@ type RejectError struct {
 
 func (e *RejectError) Error() string { return e.Message }
 
-// dispatch 走 ACK 门控 + latest-wins。
-func (c *Controller) dispatch(joints map[string]float64) error {
+// dispatch 走 ACK 门控 + latest-wins。`origin` 是这条命令的来源，随命令同行。
+func (c *Controller) dispatch(joints map[string]float64, origin string) error {
 	c.mu.Lock()
 	c.lastCommand = copyJoints(joints)
 
 	if c.inflight != nil {
-		// 有指令在途 → 只覆盖待发槽（latest-wins），不排队
+		// 有指令在途 → 只覆盖待发槽（latest-wins，来源一起覆盖），不排队
 		c.pending = joints
+		c.pendingOrigin = origin
 		suppressed := true
 		c.mu.Unlock()
 		if suppressed {
@@ -309,11 +340,14 @@ func (c *Controller) dispatch(joints map[string]float64) error {
 		return nil
 	}
 	c.mu.Unlock()
-	return c.send(joints)
+	return c.send(joints, origin)
 }
 
-// send 真正写设备，并挂上回执超时。
-func (c *Controller) send(joints map[string]float64) error {
+// send 真正写设备，并挂上回执超时。`origin` 记进 `curOrigin` 供 STATE 标注。
+func (c *Controller) send(joints map[string]float64, origin string) error {
+	if origin == "" {
+		origin = protocol.OriginCommand
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -322,6 +356,7 @@ func (c *Controller) send(joints map[string]float64) error {
 	line := protocol.EncodeJR(c.order, joints)
 	in := &inflight{joints: copyJoints(joints), at: c.nowFn()}
 	c.inflight = in
+	c.curOrigin = origin
 	lastSend := c.lastSendAt
 	now := c.nowFn()
 	c.lastSendAt = now
@@ -438,17 +473,19 @@ func abs(v float64) float64 {
 	return v
 }
 
-// drainPending 把待发槽里的最新命令补发出去（尾沿语义）。
+// drainPending 把待发槽里的最新命令补发出去（尾沿语义）。来源与命令同行。
 func (c *Controller) drainPending() {
 	c.mu.Lock()
 	next := c.pending
+	origin := c.pendingOrigin
 	c.pending = nil
+	c.pendingOrigin = ""
 	closed := c.closed
 	c.mu.Unlock()
 	if next == nil || closed {
 		return
 	}
-	if err := c.send(next); err != nil {
+	if err := c.send(next, origin); err != nil {
 		c.emitError(protocol.CodeDeviceDown, err.Error())
 	}
 }
@@ -456,6 +493,21 @@ func (c *Controller) drainPending() {
 // ---------------------------------------------------------------------------
 // 状态与订阅
 // ---------------------------------------------------------------------------
+
+// commandOrigin 返回"最近一次真正发出的命令"的来源，用于标注设备回执的 STATE 帧。
+//
+// 为什么需要它（而不是在 handleLine 里看 inflight）：命令的应答（`OK JR`）一到就
+// 放行 ACK 门控并清空 `inflight`，而这批 STATE 是**随后的位置推进帧**（设备按速度
+// 斜坡爬升期间逐帧上报）。它们的来源仍是刚发出的那条命令 —— 记在 `curOrigin` 才能
+// 让"一段斜坡"整体带对来源，前端才能平滑跟随（而不是只跟第一帧）。
+func (c *Controller) commandOrigin() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.curOrigin == "" {
+		return protocol.OriginCommand
+	}
+	return c.curOrigin
+}
 
 func (c *Controller) publishState(joints map[string]float64, origin string) {
 	c.mu.Lock()

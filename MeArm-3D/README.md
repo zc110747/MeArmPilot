@@ -554,7 +554,7 @@ AI · 机器学习 · 强化学习（PPO/SAC）· 自训练 · 视觉识别 · �
 误差趋势 sparkline + 健康结论）→ **模型 · ROBOT MODEL**。</sub>
 
 ## 6. 当前验收数据（Phase 1–15 + MuJoCo 轨 M1–M10 + 多机器人轨 P0–P8）
-> 各 Phase 的逐项验收证据见 §5 的「验收证据」列；决策与判据见 `docs/decisions.md`（D1–D79）。
+> 各 Phase 的逐项验收证据见 §5 的「验收证据」列；决策与判据见 `docs/decisions.md`（D1–D84）。
 
 **一键验收（仓库根执行）**：
 
@@ -568,14 +568,18 @@ $PY robot-package/mearm-v1/tools/gen_mearm_v1_baseline.py --check   # 黄金数�
 node core/tools/verify_device_follow.mjs --config sim      # 设备侧自主变化→跟随（无需硬件）
 node core/tools/verify_device_follow.mjs --config mujoco   # 同上（物理链路；容差 1.0°，理由见 D81）
 node core/tools/verify_device_follow.mjs --config serial   # 同上（需真机；**会真的动**）
+node core/tools/verify_external_origin.mjs                 # TCP 入口来源标注分段 A/B/C（3 段；零依赖、无需浏览器）
+node frontend/tests/e2e/external-origin-follow.mjs         # 浏览器侧：外部驱动时主臂与幽灵是否重合（需 8090 后端 + 5273 vite dev）
 ```
 
-**最近一次全绿概要**（2026-09-16）：`tsc` 0 error · `vitest` **439 passed**（142 文件）·
-`go vet` 干净 · `go test` **89 个顶层用例**全绿（5 包 · 0 FAIL）· `pytest` **214 passed**
+**最近一次全绿概要**（2026-09-17 实跑 `tsc` / `vitest` / `go vet` / `go test`）：
+`tsc` 0 error · `vitest` **442 passed**（`Test Files 33 passed`）·
+`go vet` 干净 · `go test` **114 个顶层用例**全绿（6 包 · 0 FAIL）· `pytest` **214 passed**
 （core/tests 31 · tests/sim 167 · tests/sim2sim 9 · robot-package 7）· 真值冻结 ✅ ·
 4 份黄金数据逐位一致 · `verify_device_follow.mjs` sim **23/23** · mujoco **22/22** · serial **23/23**
 （真机；mujoco 连跑 3 次稳定）· 前端 DOM 读「状态 · Status」表 **9/9** ·
 `run_sim2sim.py --all` 覆盖 mearm-v1 + so-arm101。
+（`pytest` 与 `verify_device_follow.mjs` 各项为 2026-09-16 实测，本轮未重跑。）
 
 > **真机的证书型数字**（`go test` 计数 / 固件资源占用 / 相机残差）**一律现跑现取**：
 > 三份 README 各抄过一份计数，实测漂移成 147 / 161 / 318 / 425 四个版本。

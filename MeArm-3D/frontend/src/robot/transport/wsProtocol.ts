@@ -117,16 +117,21 @@ export const SERVER_PONG = 'pong';
 export const SERVER_DEVICE_STATUS = 'device_status';
 
 /**
- * 关节状态的来源（字面量与后端 `protocol.OriginCommand` / `OriginDevice` 一致）。
+ * 关节状态的来源（字面量与后端 `protocol.Origin*` 一致）。
  *
  * `device` 表示设备侧**自主变化**（硬件摇杆 / 红外遥控 / 面板手拧 / 调试直控）——
  * 界面必须让命令侧跟随，否则滑杆、主臂、目标点会停在旧值上，
  * 而画面上看不出任何异常。
  *
+ * `external` 表示**另一台上位机**经外部入口（TCP JSON v1）下的命令。它同样必须
+ * 让命令侧跟随 —— 否则画面会变成"只有半透明的实际臂在动、主臂不动"，
+ * 且本页指令侧停在旧值（用户下一次动本页控件会把整组旧指令下发）。
+ *
  * ⚠️ 缺省（字段不存在）按 `command` 处理：老后端不发它，行为与引入前一致。
  */
 export const ORIGIN_COMMAND = 'command';
 export const ORIGIN_DEVICE = 'device';
+export const ORIGIN_EXTERNAL = 'external';
 
 export const CODE_BAD_MESSAGE = 'BAD_MESSAGE';
 export const CODE_VERSION = 'VERSION_MISMATCH';
@@ -182,7 +187,7 @@ export interface ServerEnvelope {
   model?: BackendModelInfo;
   device?: string;
   connected?: boolean;
-  /** 关节状态来源（`ORIGIN_COMMAND` / `ORIGIN_DEVICE`）；缺省按 command 处理 */
+  /** 关节状态来源（`ORIGIN_COMMAND` / `ORIGIN_DEVICE` / `ORIGIN_EXTERNAL`）；缺省按 command 处理 */
   origin?: string;
 }
 

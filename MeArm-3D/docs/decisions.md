@@ -3,7 +3,106 @@
 记录"为什么这么做"，尤其是**与原 spec 示例不一致**的地方，方便后续复盘与修改。
 每条都有编号，代码注释会引用编号（如 `D2`）。
 
-> 本文**最新条目在前**（D82 在最上，D1 在最下）。
+> 本文**最新条目在前**（D84 在最上，D1 在最下）。
+
+## D84 · 新增 `origin=external`：让「另一台上位机在驱动」被对端页面正确跟随
+
+**背景**：`MeArm-RemoteControl`（`arm-web`）在 network 模式下作为 TCP Client 经 9100
+驱动本后端的 Sim。功能上链路是通的（摇杆 → Sim → 状态回推），但用户在 MeArm-3D 页面上
+看到的现象是：**只有半透明的"实际臂幽灵"在动，不透明的主臂不动**。
+
+**根因**（代码 + 实测双证）：前端有两条渲染路径 —— 主臂画 `commandJoints`（"要去哪"），
+幽灵画 `actualJoints`（"现在在哪"）。`transportBridge.handleState` 只对后端标注
+`origin === 'device'` 的帧做「命令侧跟随」（写 `commandJoints` + 抑制回发），
+其余来源一律只写 `actualJoints`。而 TCP 入口**借用了 `command`** —— 因为 `Apply` 的
+默认来源就是它。探针实测：经 9100 发一条 `servo`，抓 `/ws/joint` 得 **8/8 帧
+`origin=command`、零帧 `device`**，与推断一致。
+
+**危害不止观感**：对端的 `commandJoints` 停在旧值。用户下一次动页面上**任何一个**控件，
+会把**整组旧指令**一次性下发 —— 真机上表现为机械臂突然跳回旧位姿。
+
+**决策**：新增第三个来源常量 `OriginExternal`。`move` / `gripper` / `servo` 一律经
+`Arm.ApplyFrom(protocol.OriginExternal, …)` 下发；前端把它与 `device` **同等对待**
+（跟随 + 抑制回发）。
+
+**为什么不让对端"凡不是自己引起的一律跟随"**（即把 `command` 也纳入跟随）：
+`command` 帧由对端**自己**刚下发的命令引起，命令侧**本来就在那个值上**，跟随是 no-op；
+但在快速拖动时会有多条命令在途，**旧命令**的状态帧到达时去写命令侧，会把用户的**新**
+拖动位置覆盖掉 —— 表现为拖动时指针回弹/抖动。所以 `command` 必须保持不跟随。
+
+**为什么不复用 `device`**：语义不同，而且**来源必须可观测区分**。`device` 的含义是
+"设备侧自主变化（摇杆 / 红外 / 手拧）"，其日志文案就是照此写的；外部入口若借 `device`，
+排障面板会对着现场**误报**一次"手动拨动了机械臂"，掩盖真正的原因（另一台上位机在下命令）。
+日志文案分开是本次特意保留的判据之一。
+
+**实现上的两个易错点**（都已固化在注释里）：
+
+1. **来源必须随命令同行**，不能等状态帧到了再从 `inflight` 取：`OK JR` 一到就
+   `finishInflight()` 清空 inflight，而后续 `STATE` 推进帧仍属于刚发出的命令。
+   因此来源存进 `curOrigin` / `pendingOrigin`，与 joints 一起走 `dispatch → send`。
+   在途 latest-wins 时进待发槽的 `pendingOrigin` 也必须一起覆盖，否则尾沿补发会用错来源。
+2. **前端有两层 origin 闸门**，只改一层不够：后端常量层 + `WebSocketTransport` 把
+   `env.origin` 映射成 `'device' | undefined` 的**白名单**。漏改白名单的症状极具迷惑性 ——
+   后端明明标了 `external`，页面却不跟随；`tsc` 也会顺带报
+   `TS2367: ... '"command" | undefined' 和 '"external"' have no overlap`。
+
+**刻意不做的事**：不改任何既有命令的语义 / 几何 / 限位 / 应答格式；不新增角度常数；
+不引入订阅或推送；`Apply()` 保留为 `ApplyFrom(OriginCommand, …)` 的薄包装，
+既有调用点行为逐字节不变。
+
+**验收**：
+- 后端 `go build` / `go vet` 干净，`go test ./...` 全绿（含新增 3 条来源断言）。
+  并以**变异测试**反证测试有效性：把 `commandOrigin()` 临时改成恒返 `OriginCommand`，
+  两条 controller 测试如实变红且报错直指根因，随后恢复。
+- 前端 `tsc -b --force` 干净；vitest **33 文件 / 442 用例 PASS**（原 439 + 新增 3 条）。
+- 端到端探针（`core/tools/verify_external_origin.mjs`，零依赖、无需浏览器）三段严格分离：
+  本页命令 → `command`、外部 TCP → `external`、再回本页 → **回到** `command`（3/3）。
+- 浏览器 e2e（`frontend/tests/e2e/external-origin-follow.mjs`，headless Edge + CDP +
+  dev 探针）：外部驱动后 `commandJoints` 变化、主臂末端位移 114.97 mm、
+  `|tcp − actualTcp| = 0.000 mm`、渲染侧两棵树 TCP 世界坐标重合 0.000 mm、
+  日志出现"外部入口在驱动"且不误报"设备侧自主变化"、**未触发本页下发**
+  （9 PASS / 0 FAIL）。
+- Sim2Sim 端到端仍 **30 PASS / 0 FAIL**（D83 当时记的 29/29 是补 XYZ 段前置条件之前的数字）。
+
+**真机链路未测**（`NOT TESTED`）：本次全部验证在 Sim 上完成。
+
+---
+
+## D83 · TCP v1 补一个**只读** `state`：让外部客户端能建立"当前角"基准，且不碰 controller / device / 几何
+
+**背景**：`MeArm-RemoteControl`（`arm-web`）新增 network 模式，作为 TCP Client 接入本后端的
+TCP 控制接口。它的网页摇杆是**增量**语义（推杆 = 角度持续变化），必须先知道"现在在哪"
+才能积分出要下发的绝对角；但 TCP v1 原有命令（`move` / `gripper` / `servo`）**全是写命令**，
+没有任何只读查询 —— 客户端只能自己猜一个起步角，首次动作就与实际位姿脱节。
+
+**决策**：给 TCP v1 加 `state` 命令，**只读**。实现只是 `dispatch` 里一个 case + `readState()`，
+复用已有的 `h.state()`（它原本就用于给每条成功应答附带状态快照）：
+
+```go
+case "state":
+    // 只读：不碰 Apply、不碰 device，因此不需要 h.mu（见文件头注释）。
+    return h.readState()
+```
+
+**为什么这是最小改动**：不动 controller / device / IK / FK / MJCF / WS / HTTP / 前端；
+不新增任何角度常数（状态里的角度来自模型与设备，不是新造的第二份真值）；
+不改变任何既有命令的行为与应答格式 —— `move` / `gripper` / `servo` 的应答本就带 `state`
+（经 `ok(cmd)` 统一附上），只是以前**没有办法单独索取**它。
+
+**刻意不做的事**：不做订阅 / 主动推送（保持"一问一答"的窄接口）、不加时间戳与历史
+（那会变成第二个真值源）、不接受任何参数（避免长成通用查询接口）。
+
+**降级路径放在消费端**：客户端连不上或不认识 `state`（老版本后端）时，退回其配置里的
+`fallback_angle` 并在 UI 显式上报，**不静默猜** —— 保证"新客户端 + 老后端"不会假装
+自己知道当前位姿。
+
+**验收**：`internal/tcpserver/protocol_test.go` 新增用例覆盖——只读性（`state` 不产生位移）、
+基准值来自 HOME 派生而非硬编码、能反映紧随其后的写命令、`cmd` 大小写不敏感；
+后端 `go test ./...` **111 PASS** + `go vet` 干净。消费端端到端（Sim2Sim）**29 / 29**。
+协议文档已补 §3.4 与错误码 `no state available yet`。
+
+**已知限制**：`state` 返回的仍是**命令值 / 目标值**（与 D82 的 `state.joints` 同源），
+**不是舵机实际位置** —— 真机没有位置回读（见根 README §9）。
 
 ## D82 · TCP JSON 控制接口是**第四个入口**，不是第四个控制核心：后端运动学只在新文件里补，几何从 `robot.yaml` 推导，判据用冻结基线
 

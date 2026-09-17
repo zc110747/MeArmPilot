@@ -59,15 +59,47 @@
         <div>S8(左): <span id="a8">--</span></div>
         <div>S9(底座): <span id="a9">--</span></div>
       </div>
-      <h3>快捷指令</h3>
-      <div class="btns">
+      <h3>快捷指令 <span class="hint" id="cmd-hint"></span></h3>
+      <div class="btns" id="arm-btns">
         <button data-cmd="RESET">复位 RESET</button>
         <button data-cmd="STATUS">状态 STATUS</button>
         <button data-cmd="JOYHW OFF">摇杆硬件关</button>
         <button data-cmd="JOYHW ON">摇杆硬件开</button>
       </div>
+
+      <!-- 网络链路（MeArm-3D TCP）专属面板：**纯新增区块**，不改造上面任何元素。
+           显示哪几项由链路的 caps 决定（串口模式下整块隐藏），
+           所以同一份页面在两种模式下都成立。 -->
+      <div id="net-panel" hidden>
+        <h3>网络控制 <span class="hint" id="net-device"></span></h3>
+        <div class="net-row">
+          <label for="xyz-step">XYZ 步长 (mm)</label>
+          <input id="xyz-step" type="number" value="5" min="0.5" max="50" step="0.5" />
+        </div>
+        <div class="btns" id="xyz-btns">
+          <button data-xyz="x+" title="沿 X 正向（前）">X +</button>
+          <button data-xyz="x-" title="沿 X 负向（后）">X −</button>
+          <button data-xyz="y+" title="沿 Y 正向（左）">Y +</button>
+          <button data-xyz="y-" title="沿 Y 负向（右）">Y −</button>
+          <button data-xyz="z+" title="沿 Z 正向（上）">Z +</button>
+          <button data-xyz="z-" title="沿 Z 负向（下）">Z −</button>
+        </div>
+        <div class="btns" id="grip-btns">
+          <button data-grip="open">爪 张开</button>
+          <button data-grip="close">爪 闭合</button>
+        </div>
+        <h3>舵机直控 <span class="hint">绝对角</span></h3>
+        <div class="servo-rows" id="servo-rows"></div>
+        <div class="readout net-readout">
+          <div>末端 TCP: <span id="net-tcp">--</span></div>
+        </div>
+        <div class="btns">
+          <button id="net-refresh">刷新状态</button>
+        </div>
+      </div>
+
       <div class="term">
-        <div class="term-title">串口回显</div>
+        <div class="term-title">链路日志</div>
         <pre id="term"></pre>
       </div>
     </div>
@@ -76,5 +108,6 @@
   <script src="/js/wsclient.js"></script>
   <script src="/js/joystick3d.js"></script>
   <script src="/js/main.js"></script>
+  <script src="/js/netpanel.js"></script>
 </body>
 </html>

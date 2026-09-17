@@ -93,6 +93,27 @@ tcp:
 校验**复用**舵机硬件行程 `Actuator.Limits`，再经 `ServoToJoint` 换算成关节角
 交给 `Apply` ⇒ 关节限位仍由 controller 兜底。两套限位同源。
 
+### 3.4 `state` —— 读当前状态（**只读**，v1.1 补）
+
+```json
+{"cmd":"state"}
+```
+
+无参数、**无副作用**：不调用 `Apply`、不碰 `device`、不占 ACK 门控。
+应答与写命令的成功应答同构（`ok:true` + `state`）。
+
+**为什么必须有它。** v1 的前三条命令全是**写**命令 —— 任何外部控制器在"首次下发
+之前"都拿不到当前舵机角。而舵机级控制是**绝对角**语义（`servo` 要的是目标角），
+没有基准就只能猜，猜错的第一帧就是一次可见的跳变。
+`MeArm-RemoteControl` 的网络模式正是这个场景：它连上后先发一条 `state` 拿基准，
+再开始增量下发。
+
+它同时兑现了「状态反馈优先复用服务端真值」的要求：**没有新增状态系统**，
+只是把已有的 `h.state()` 暴露成一个入口。
+
+> ⚠️ 返回的 `servo` / `joints` 仍是**命令值**（= 最近一次被受理的目标），
+> 不是设备过程值 —— 与 §3 其它命令、以及 WS 侧 `joint_states` 的语义一致（见 §8）。
+
 ---
 
 ## 4. 应答
@@ -130,6 +151,7 @@ tcp:
 | `missing action` / `invalid action` | `gripper` 参数问题（只认 `open`/`close`） |
 | `missing servo` / `invalid servo (expected 1..N)` / `missing angle` / `invalid angle` | `servo` 参数问题 |
 | `angle out of range (<id> min..max)` | 舵机角超出该舵机硬件行程 |
+| `no state available yet` | `state` 收不到快照（正常路径不可达：`controller.New` 已把命令值初始化为 HOME） |
 
 任何错误**只影响这一条命令**，连接保持可用（验收中"错误轰炸 10 条后仍可正常
 下发"是硬指标）。
@@ -141,10 +163,37 @@ tcp:
 | 项 | 做法 |
 |----|------|
 | 限位 | 关节限位走 `Model.Validate`（`controller.Apply` 内部）；舵机行程走 `Actuator.Limits`。TCP 层**不持有任何角度常数** |
-| 不绕过设备 | 命令一律经 `controller.Apply`，与 WebSocket 同一条路（ACK 门控 / latest-wins 一致） |
+| 不绕过设备 | 命令一律经 `controller.ApplyFrom`，与 WebSocket 同一条路（ACK 门控 / latest-wins 一致） |
+| 来源标注 | 三条写命令一律声明 `origin=external`（见 §5.1），不使用 `Apply` 的默认来源 |
 | 多客户端 | 允许并发连接；`Handler` 内的互斥量把「读当前 → 算目标 → 下发」做成原子操作，避免相对位移互相踩踏 |
 | 崩溃隔离 | 每连接独立 goroutine + `recover()`；单连接 panic 不会拖垮后端进程 |
 | 非法输入 | `Execute` 对任何输入都返回 `Result`，不返回 error、不 panic |
+
+### 5.1 为什么三条写命令都带 `origin=external`
+
+WS 侧的状态帧带一个 `origin` 字段（字面量见 `internal/protocol`），**它决定对端页面
+要不要让"命令侧跟随"**：
+
+| `origin` | 含义 | 对端页面的行为 |
+|----------|------|----------------|
+| `command` | 由对端**自己的**命令引起（`JR` 应答 / 回读） | 只更新"实际臂"，命令侧不动 |
+| `device` | 设备**自主**变化（硬件摇杆 / 红外 / 手拧 / 调试直控） | 命令侧跟随 + 抑制回发 |
+| `external` | **另一台上位机**经本接口下发的命令 | 命令侧跟随 + 抑制回发（同 `device`） |
+
+TCP v1 的写命令若借用 `command`，对端会表现为：
+
+1. **画面上只有半透明的"幻影臂"在动，不透明的主臂与滑杆停在旧值** ——
+   看起来像渲染故障，实际是来源标注错了。
+2. **更危险**：对端的 `commandJoints` 停在旧值。用户下一次动页面上**任何一个**
+   控件，就会把**整组旧指令**一次性下发 —— 真机上表现为机械臂突然跳回旧位姿。
+
+因此 `move` / `gripper` / `servo` 一律经 `Arm.ApplyFrom(protocol.OriginExternal, …)`
+下发。这**只新增一个来源字面量**，不改任何既有命令的语义、几何、限位与应答格式；
+不带 `origin` 的旧客户端行为与引入前完全一致。
+
+> 判据落点：`internal/tcpserver/protocol_test.go::TestWriteCommands_CarryExternalOrigin`
+> （三条写命令逐一断言来源）、`internal/controller/controller_test.go` 的两条
+> （外部命令的状态帧标 `external`、在途 latest-wins 场景来源不丢）。
 
 ---
 

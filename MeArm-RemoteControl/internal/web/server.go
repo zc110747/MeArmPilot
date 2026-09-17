@@ -1,14 +1,18 @@
 // package web 提供本机控制用的 HTTP 服务与 WebSocket。
 //
 //   - HTTP 服务 web/static 下的静态页面（Three.js 3D 摇杆）。
-//   - /ws 提供 WebSocket：网页把摇杆坐标 / 指令发上来，服务器归一化为
-//     arm-device 指令写串口；设备回显经 hub 以 JSON 推回网页。
+//   - /ws 提供 WebSocket：网页把摇杆坐标 / 指令发上来，经 `link.Link` 下发到
+//     当前通道（串口真机 / MeArm-3D TCP），设备回显经 hub 以 JSON 推回网页。
+//
+// 本包**不知道**当前是串口还是网络 —— 那由装配方注入的 `link.Link` 决定；
+// 两者的能力差异通过 `Caps` 显式告诉网页（见 internal/link）。
 package web
 
 import (
 	"encoding/json"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -17,46 +21,41 @@ import (
 
 	"arm-web/internal/config"
 	"arm-web/internal/hub"
-	"arm-web/internal/protocol"
-	"arm-web/internal/serial"
+	"arm-web/internal/link"
 )
 
 // Server 聚合 HTTP/WS 与依赖。
 type Server struct {
 	cfg      config.WebConfig
-	joyCfg   config.JoystickConfig
-	serial   *serial.Serial
+	link     link.Link
 	hub      *hub.Hub
-	axisMap  protocol.AxisMap
+	servoIDs []int
 	staticFS fs.FS
 
 	mu      sync.Mutex
 	clients map[*wsClient]struct{} // 仅 WebSocket 客户端，用于下发连接状态变更
 
-	// 双摇杆合并状态：左右摇杆各自最后上报的坐标，下发时合并为一条 JOY 四轴帧。
+	// 双摇杆合并状态：左右摇杆各自最后上报的坐标，下发时合并为一帧交给 link。
 	joyMu sync.Mutex
 	joyL  [2]float64 // {x, y} 左摇杆
 	joyR  [2]float64 // {x, y} 右摇杆
 
-	// 最近已知舵机角度（S6..S9）。设备仅在 STATUS / SET / JOY 应答里携带角度
-	// （可能只带部分轴），这里做合并，保证单轴回显不会把其它轴清零。
+	// 最近已知舵机角度（S6..S9）。**仅串口模式**使用：角度从设备回显文本里
+	// 解析（设备仅在 STATUS / SET / JOY 应答里携带角度，可能只带部分轴），
+	// 这里做合并，保证单轴回显不会把其它轴清零。
+	//
+	// 网络模式不走这里 —— 它的角度来自服务端结构化的 `state.servo`。
 	anglesMu   sync.Mutex
 	lastAngles [4]int  // 下标 0..3 对应 S6..S9
 	haveAngles [4]bool // 各轴是否已有过回显
 }
 
-func New(cfg config.WebConfig, joyCfg config.JoystickConfig, s *serial.Serial, h *hub.Hub, staticFS fs.FS) *Server {
+func New(cfg config.WebConfig, l link.Link, h *hub.Hub, servoIDs []int, staticFS fs.FS) *Server {
 	return &Server{
 		cfg:      cfg,
-		joyCfg:   joyCfg,
-		serial:   s,
+		link:     l,
 		hub:      h,
-		axisMap: protocol.AxisMap{
-			LXServo: joyCfg.LXServo, LYServo: joyCfg.LYServo,
-			RXServo: joyCfg.RXServo, RYServo: joyCfg.RYServo,
-			InvLX: joyCfg.InvLX, InvLY: joyCfg.InvLY, InvRX: joyCfg.InvRX, InvRY: joyCfg.InvRY,
-			DeadFrac: protocol.DeadFracFromDeg(joyCfg.DeadbandDeg),
-		},
+		servoIDs: append([]int(nil), servoIDs...),
 		staticFS: staticFS,
 		clients:  make(map[*wsClient]struct{}),
 	}
@@ -95,23 +94,43 @@ func (c *wsClient) Send(line string) {
 
 // 客户端 -> 服务器 的消息
 type clientMsg struct {
-	T    string  `json:"t"`    // joy | cmd | ping
+	T    string  `json:"t"`    // joy | cmd | xyz | grip | servo | refresh | ping
 	Side string  `json:"side"` // joy 专用：L=左摇杆 / R=右摇杆
 	X    float64 `json:"x"`    // 摇杆 X ∈ [-1,1]
 	Y    float64 `json:"y"`    // 摇杆 Y ∈ [-1,1]
-	C    string  `json:"c"`    // 原始指令文本（cmd 类型）
+	C    string  `json:"c"`    // 原始指令文本（cmd 类型，仅串口模式）
+
+	// ---- 以下仅网络模式使用（xyz / grip / servo）----
+	Axis      string   `json:"axis"`      // xyz：x | y | z
+	Direction string   `json:"direction"` // xyz：+ | -
+	Step      *float64 `json:"step"`      // xyz：步长（mm）
+	Servo     *int     `json:"servo"`     // servo：TCP 编号 1..N
+	Angle     *float64 `json:"angle"`     // servo：舵机角（度）
+	Action    string   `json:"action"`    // grip：open | close
 }
 
 // 服务器 -> 客户端 的消息
+//
+// 消息类型：
+//
+//	serial       链路回显（串口模式：设备文本行；含解析出的 angles）
+//	caps         通道能力（接入时一次，决定网页显示哪些控件）
+//	link_status  链路连接状态（接入时一次 + 每次翻转）
+//	state        网络模式的状态快照（角度 + 末端位置 + 链路末端类型）
+//	err / pong
 type serverMsg struct {
-	T           string      `json:"t"` // serial | serial_status | err | pong
-	Line        string      `json:"line,omitempty"`
-	Angles      *armAngles  `json:"angles,omitempty"`
-	Msg         string      `json:"msg,omitempty"`
-	Connected   *bool       `json:"connected,omitempty"`   // serial_status: 串口是否已连接
-	SerialErr   string      `json:"serial_err,omitempty"` // serial_status: 未连接原因
-	CommErr     *bool       `json:"comm_err,omitempty"`   // serial_status: 通讯是否失败（已连接但应答超时）
-	CommErrMsg  string      `json:"comm_err_msg,omitempty"` // serial_status: 通讯失败原因
+	T          string     `json:"t"`
+	Line       string     `json:"line,omitempty"`
+	Angles     *armAngles `json:"angles,omitempty"`
+	Msg        string     `json:"msg,omitempty"`
+	Connected  *bool      `json:"connected,omitempty"` // link_status: 链路是否已连接
+	SerialErr  string     `json:"serial_err,omitempty"` // link_status: 未连接原因（字段名为兼容沿用）
+	CommErr    *bool      `json:"comm_err,omitempty"`   // link_status: 通讯是否失败
+	CommErrMsg string     `json:"comm_err_msg,omitempty"`
+	// ---- 网络模式 ----
+	Caps   *link.Caps `json:"caps,omitempty"`   // caps 消息
+	TCP    []float64  `json:"tcp,omitempty"`    // state 消息：末端位置 [x,y,z] mm
+	Device string     `json:"device,omitempty"` // state 消息：链路末端（sim / serial / mujoco）
 }
 
 type armAngles struct {
@@ -146,13 +165,23 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer close(done)
 	go s.wsWriter(c, done)
 
-	// 接入即同步当前串口状态（连接 + 通讯），避免界面停留在“未知”
-	connected, lerr, commErr, commMsg := s.serial.Status()
-	s.sendStatusTo(c, connected, lerr, commErr, commMsg)
-	// 接入即推送当前角度快照（若有），新开的页面立刻显示既有角度
+	// 接入即同步当前通道能力（决定网页显示哪些控件），避免界面靠猜
+	s.sendCaps(c)
+	// 接入即同步链路连接/通讯状态，避免界面停留在"未知"
+	st := s.link.Status()
+	s.sendStatusTo(c, st.Connected, st.Err, st.CommErr, st.CommErrMsg)
+	// 串口模式：接入即推送当前角度快照（若有），新开的页面立刻显示既有角度
 	if ang := s.anglesSnapshot(); ang != nil {
 		s.wsSend(c, serverMsg{T: "serial", Angles: ang})
 	}
+	// 网络模式：状态是**推**给客户端的（每条应答带一次），后接入的页面会错过
+	// 之前那些推送，于是刚打开时界面停在 `--` 直到用户动一下。
+	// 这里主动拉一次只读状态把缺口补上 —— 复用 RefreshState 而不是另加一个
+	// "读缓存"接口：不走缓存就不会出现"显示的是服务端早已变更的旧值"。
+	//
+	// 失败**不上报**：链路还没连上时它只是入队等待，串口模式则是不支持 ——
+	// 两者都不是需要打扰用户的错误，连接状态条已经在如实表达链路情况。
+	_ = s.link.RefreshState()
 
 	log.Printf("[web] WebSocket 客户端接入: %s", r.RemoteAddr)
 
@@ -170,8 +199,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		case "ping":
 			s.wsSend(c, serverMsg{T: "pong"})
 		case "joy":
-			// 双摇杆遥控：左右摇杆各自上报坐标，合并为一条 JOY 四轴帧下发。
-			// 串口层做命令-应答门控 + 摇杆最新值合并（中间位置不重复下发）。
+			// 双摇杆：左右摇杆各自上报坐标，合并后交给当前通道。
+			// 串口通道内部做命令-应答门控 + 摇杆最新值合并（中间位置不重复下发）；
+			// 网络通道内部按时间积分并按舵机维度做 latest-wins。
 			side := m.Side
 			if side != "L" && side != "R" {
 				side = "L"
@@ -184,29 +214,51 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			lx, ly, rx, ry := s.joyL[0], s.joyL[1], s.joyR[0], s.joyR[1]
 			s.joyMu.Unlock()
-			// 四轴全部在动作死区内（≤10°）时整帧跳过：不下发任何指令
-			if !protocol.JoystickHasCommand(lx, ly, rx, ry, s.axisMap) {
-				continue
-			}
-			cmd := protocol.JoystickToJOYDual(lx, ly, rx, ry, s.axisMap)
-			if err := s.serial.WriteLine(cmd); err != nil {
-				s.sendErr(c, "串口未连接，无法下发")
+			if err := s.link.Joy(lx, ly, rx, ry); err != nil {
+				s.sendErr(c, err.Error())
 			}
 		case "cmd":
-			ok, normalized, verr := protocol.Validate(m.C)
-			if !ok {
-				s.sendErr(c, verr.Error())
+			if err := s.link.Raw(m.C); err != nil {
+				s.sendErr(c, err.Error())
+			}
+		case "xyz":
+			if m.Step == nil {
+				s.sendErr(c, "xyz 缺少 step")
 				continue
 			}
-			log.Printf("[web] 指令 %q -> 下发(归一化) %q", m.C, normalized)
-			if err := s.serial.WriteLine(normalized); err != nil {
-				s.sendErr(c, "串口未连接，无法下发")
+			log.Printf("[web] XYZ %s%s step=%v", m.Axis, m.Direction, *m.Step)
+			if err := s.link.XYZ(m.Axis, m.Direction, *m.Step); err != nil {
+				s.sendErr(c, err.Error())
+			}
+		case "grip":
+			log.Printf("[web] 夹爪 %s", m.Action)
+			if err := s.link.Gripper(m.Action); err != nil {
+				s.sendErr(c, err.Error())
+			}
+		case "servo":
+			if m.Servo == nil || m.Angle == nil {
+				s.sendErr(c, "servo 缺少 servo / angle")
+				continue
+			}
+			log.Printf("[web] 直接舵机 %d = %v", *m.Servo, *m.Angle)
+			if err := s.link.ServoDirect(*m.Servo, *m.Angle); err != nil {
+				s.sendErr(c, err.Error())
+			}
+		case "refresh":
+			if err := s.link.RefreshState(); err != nil {
+				s.sendErr(c, err.Error())
 			}
 		default:
 			s.sendErr(c, "未知消息类型: "+m.T)
 		}
 	}
 	log.Printf("[web] WebSocket 客户端断开: %s", r.RemoteAddr)
+}
+
+// sendCaps 把通道能力推给客户端（接入时一次）。
+func (s *Server) sendCaps(c *wsClient) {
+	caps := s.link.Caps()
+	s.wsSend(c, serverMsg{T: "caps", Caps: &caps})
 }
 
 // wsWriter 把设备回显（经 hub）封装成 JSON 推送给浏览器，
@@ -283,32 +335,60 @@ func (s *Server) removeClient(c *wsClient) {
 	delete(s.clients, c)
 }
 
-// sendStatusTo 向单个客户端推送串口连接/通讯状态。
-func (s *Server) sendStatusTo(c *wsClient, connected bool, serialErr string, commErr bool, commErrMsg string) {
+// sendStatusTo 向单个客户端推送链路连接/通讯状态。
+func (s *Server) sendStatusTo(c *wsClient, connected bool, lerr string, commErr bool, commErrMsg string) {
 	s.wsSend(c, serverMsg{
-		T:          "serial_status",
+		T:          "link_status",
 		Connected:  &connected,
-		SerialErr:  serialErr,
+		SerialErr:  lerr,
 		CommErr:    &commErr,
 		CommErrMsg: commErrMsg,
 	})
 }
 
-// BroadcastStatus 把串口连接/通讯状态变更广播给所有 WebSocket 客户端。
-// 由 serial.SetStatusHandler 在连接状态或通讯状态翻转时调用。
-func (s *Server) BroadcastStatus(connected bool, serialErr string, commErr bool, commErrMsg string) {
-	data, err := json.Marshal(serverMsg{
-		T:          "serial_status",
+// BroadcastStatus 把链路连接/通讯状态变更广播给所有 WebSocket 客户端。
+// 由装配方在 serial / netlink 的状态回调里调用。
+//
+// 消息类型原名 `serial_status`，随 Link 抽象统一为 `link_status`——
+// 它现在描述的是"当前通道"而不是"串口"。字段名 `serial_err` 沿用以免
+// 前后端两处不同步地各改一次。
+func (s *Server) BroadcastStatus(connected bool, lerr string, commErr bool, commErrMsg string) {
+	s.broadcast(serverMsg{
+		T:          "link_status",
 		Connected:  &connected,
-		SerialErr:  serialErr,
+		SerialErr:  lerr,
 		CommErr:    &commErr,
 		CommErrMsg: commErrMsg,
 	})
+}
+
+// BroadcastNetState 网络模式：把服务端状态快照广播给所有网页客户端。
+//
+// ⚠️ 角度一律来自服务端**结构化**的 `state.servo`（成功应答里带回来的），
+//    不是本地缓存推定的值，也不是"命令发出去就算到位"。若服务端没给状态，
+//    这里什么也不推 —— 界面停在 `--`，而不是显示一个编出来的角度。
+func (s *Server) BroadcastNetState(servo []float64, tcp []float64, device string) {
+	msg := serverMsg{T: "state", Angles: s.netAngles(servo), TCP: tcp, Device: device}
+	s.broadcast(msg)
+}
+
+// BroadcastError 把一条链路级错误广播到网页。
+//
+// 网络模式用它上报"服务端拒绝"与"降级提示"（例如服务端不认识 `state`、
+// 目标角被行程拒绝并已回滚）；串口模式不用它（错误随回显文本一起走）。
+func (s *Server) BroadcastError(msg string) {
+	s.broadcast(serverMsg{T: "err", Msg: msg})
+}
+
+// broadcast 把一条消息发给所有 WebSocket 客户端。
+//
+// 快照客户端集合后再写：WriteMessage 是阻塞式网络写，绝不能在持锁状态下执行，
+// 否则一个半死连接会把所有下发路径一起拖住。
+func (s *Server) broadcast(msg serverMsg) {
+	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-	// 快照客户端集合后再写：WriteMessage 是阻塞式网络写，绝不能在持锁状态下
-	// 执行，否则一个半死连接会把 WriteLine（Connected() 取同一把锁）全部拖住。
 	s.mu.Lock()
 	clients := make([]*wsClient, 0, len(s.clients))
 	for c := range s.clients {
@@ -318,6 +398,35 @@ func (s *Server) BroadcastStatus(connected bool, serialErr string, commErr bool,
 	for _, c := range clients {
 		c.conn.WriteMessage(string(data))
 	}
+}
+
+// netAngles 把 MeArm-3D 的 `state.servo` 数组（按 TCP 编号 1..N 排列）
+// 转成网页既有的 S6..S9 视角。
+//
+// 映射表就是 `network.servo_ids` —— 与摇杆轴映射**共用同一份接线表**，
+// 不另开一张（两张表必然漂移）。
+func (s *Server) netAngles(servo []float64) *armAngles {
+	if len(servo) == 0 || len(s.servoIDs) == 0 {
+		return nil
+	}
+	out := &armAngles{OK: len(servo) >= len(s.servoIDs)}
+	for i, id := range s.servoIDs {
+		if i >= len(servo) {
+			return nil
+		}
+		v := int(math.Round(servo[i]))
+		switch id {
+		case 6:
+			out.S6 = v
+		case 7:
+			out.S7 = v
+		case 8:
+			out.S8 = v
+		case 9:
+			out.S9 = v
+		}
+	}
+	return out
 }
 
 // parseAngles 从回显行中提取出现的舵机角度（可能只有部分轴）。
