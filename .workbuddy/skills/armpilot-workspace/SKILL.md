@@ -10,7 +10,8 @@ agent_created: true
 再进专项文档。专项 skill 的**权威正文不在本文件**（避免双重维护），只登记路由。
 
 > 2026-09-17 校订：端口 / 真值源路径 / 路由表 / 基线数字均已按**磁盘与代码实况**更正。
-> 旧版里的 `8080`、`config/robot.yaml`、以及三个已不存在的 `arm-*` skill 都是历史遗留。
+> 旧版里的 `8080`、`config/robot.yaml` 是历史遗留；它当时指向的 5 个 `arm-*` skill
+> **已于 2026-09-17 按 §3.1 重建**（原件不可恢复，现为忠实重建版）。
 
 ## 0. 三个子项目的分工（别搞混端口）
 
@@ -55,26 +56,43 @@ agent_created: true
 ## 3. ★ 路由表：想查什么，去哪个 skill
 
 **下表只登记磁盘上真实存在的 skill**（2026-09-17 对 `~/.workbuddy/skills/` 与本仓 `.workbuddy/skills/`
-做过全量 `ls` 核实）。已缺失的名字见 §3.1，**别再按旧文档去找它们**。
+做过全量 `ls` 核实）。**专项 skill 的 5 个 arm-\* 已于 2026-09-17 重建**（详见 §3.1）。
 
 | skill | 位置 | 管什么 |
 |-------|------|--------|
 | **`armpilot-workspace`** | 本仓 `.workbuddy/skills/` | **本文件** —— 工程导航 + 跨项目铁律（入口） |
 | `arm-tcp-client-link` | 用户级 | **客户端侧**新增 TCP Client 传输（保留原链路）：基准缺失先补只读查询、跨链路方向换算、被拒回滚可观测、单写泵、Sim2Sim 验收从配置派生；也覆盖"入口**能驱动** ≠ 对端界面显示对了"（origin 语义） |
+| `arm-ws-joint-link` | 用户级 | 关节级 WS/JSON 链路的 **origin 语义与跟随**（第三方入口必须标身份）、双树渲染（主臂 vs 幽灵）、命令门控与 latest-wins、前端探针假 FAIL 清单 |
+| `arm-robot-serial` | 用户级 | 舵机级**串口/固件链路**：协议分层（谁在合成状态）、独立计数器判据、诊断脚本的 4 个度量陷阱、复位吞命令窗口、两条独立证据链 |
+| `arm-mechanism-photogrammetry` | 用户级 | **机构几何真值**取证：照片/CAD 反解关节轴、能力边界（无位置回读 / 贴边即截断）、改真值的连锁校验顺序、冻结基线语义边界 |
+| `arm-mujoco-physics-sim` | 用户级 | MuJoCo **对等实现与判据验证**：MJCF 为物理真值、Sim2Sim 单份判据、容差按对象登记、**跨批 + 注入**证明判据能红 |
+| `arm-backend-new-ingress` | 用户级 | 服务端**新增入口/链路**的纪律：adapter 分层、跨链路语义换算、XYZ→关节角禁自证、链路不对称登记成设计、搬迁/重构纪律 |
 | `robotics-multiphysics-vmodel-workflow` | 用户级 | 多物理场 / 多实现项目：真值只有一份、冻结基线 + **语义核心哈希**、**三条实现互证**（不是自证） |
 | `duplicated-truth-forensics` | 用户级 | "同一个量在两处被独立实现、数值悄悄不一致"的取证套路（症状轻微偏差、随机拒答、不崩） |
 
-### 3.1 ⚠️ 已缺失的历史路由目标（2026-09-17 核实，**别再引用**）
-
-以下名字在旧文档 / 旧日志里被当作 skill 引用，但**磁盘上不存在**；本仓 git 历史里
-`.workbuddy/skills/` 也只提交过 `armpilot-workspace`：
+### 3.1 这 5 个专项 skill 曾一度消失，已于 2026-09-17 **重建**（附取证结论）
 
 `arm-mechanism-photogrammetry` · `arm-robot-serial` · `arm-ws-joint-link` · `arm-backend-new-ingress` ·
 `arm-mujoco-physics-sim`
 
-相应知识**不再有单点汇总**，目前散落在：各子项目 `.workbuddy/memory/`、`MeArm-3D/docs/decisions.md`
-（ADR）、`MeArm-3D/.workbuddy/analysis/`、以及代码注释里。**要恢复请当成一次显式任务做**
-（别假设它们还在，也别照着旧路由表去 load）。
+**取证（2026-09-17，全部实查）**：原件**不可恢复** ——
+`~/.workbuddy` 不是 git 仓（用户级 skill 无版本历史）· 本仓 git 历史只提交过 `armpilot-workspace` ·
+本仓与 `MCU-Agent` 的 skill 镜像里都没有它们 · WorkBuddy 的文件快照库（`file-history/`、`blobs/`）
+逐文件搜过，零命中 · 会话转写里只有"**提及**"（日志、压缩摘要、一句 note），没有 SKILL.md 正文的写入记录。
+它们**确实存在过**（2026-09-15 日志留了它们的体积台账），但**为何消失无从考证**。
+
+**但知识本体从未丢失** —— 完整存活在 `MeArm-3D/.workbuddy/memory/playbook.md` §1–§15
+（994 行 / 47.8k 字符，正是这 5 个 skill 的领域之和）。现已据该 playbook **按 §15 纪律重建**：
+正文 4.0–6.2k 字符、description 单行 171–225 字符（见 §3 路由表）。
+
+⚠️ **仍是"名义"的名字**（日志里出现过、磁盘上没有、**未**重建）：
+`arm-photo-texturing` · `webui-headless-cdp-verify`。二者内容疑已被覆盖
+（前者 ≈ 本工程的**外观/纹理轨**，后者 ≈ `webgl-first-frame-forensics` 的 headless CDP 取证手法）
+—— 要恢复请**先确认是否重复**。
+
+⚠️ **纪律提醒**：`~/.workbuddy/skills/` **不在任何 git 仓库内** ⇒
+新建/修改 skill 后的"同步"只能是**写进本记忆 + 落当日日志**，**不是 commit**。
+这正是本次丢失**不可恢复**的根本原因 —— 重要 skill 请同时在工程侧留指针（`README.md` / ADR / 本文件）。
 
 ## 4. ★ 验收节奏（每个模块完成即走一遍）
 

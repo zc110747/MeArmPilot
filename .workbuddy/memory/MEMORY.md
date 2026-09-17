@@ -57,7 +57,7 @@
 ## 五、skill 与文档落点
 
 - skill 全清单由系统每会话注入，此处不重复；**入口 = `.workbuddy/skills/armpilot-workspace/SKILL.md`**
-  （含真实路由表与**已缺失 skill 清单** —— 旧文档引用的 5 个 `arm-*` 均已不在磁盘上）。
+  （含真实路由表；5 个 `arm-*` 专项 skill 曾一度消失，**已于 2026-09-17 重建**，取证见其 §3.1）。
 - ⚠️ 后端**没有** FK/IK；XYZ→关节角只能走「冻结基线 + 三条实现互证」（`simulation/mujoco/sim2sim.py`
   + `fkref.py`，入口 `core/tools/run_sim2sim.py`），**不要自证**。
 - 设计决策 → `MeArm-3D/docs/decisions.md`（最新在前）；项目全貌/验收数据 → 各子项目 `README.md`；
