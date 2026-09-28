@@ -21,6 +21,8 @@
 | ④ servo | 1..4 都能下单号 |
 | ⑤ 错误 | 非法 JSON / 未知命令 / 非法轴 / 缺参数 / 角度越界 → 都 `ok=false` 且**连接仍可用** |
 | ⑥ 健壮 | 超长行不会打死服务；断线重连照常工作 |
+| ⑦ XYZ 矢量（v2） | `movexyz` 三轴同时位移、`moveto` 绝对定位**且幂等**、`home` 归位；可达目标点由 `caps` 的几何+限位**构造**出来，不写死坐标 |
+| ⑧ 矢量参数错误 | 缺 delta / 形状错 / 全零位移 / 缺 xyz → 都 `ok=false` |
 
 ★ **不做**的事：不校验 IK/FK 的数值（那由 `backend/internal/robot/kinematics_test.go`
 拿冻结基线把关），也不改任何配置。这里只证明"接口通、语义对、出错不乱"。
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import sys
 from pathlib import Path
@@ -74,6 +77,38 @@ class Client:
             self.sock.close()
         except OSError:
             pass
+
+
+def fk(pose: dict, geom: dict) -> list[float]:
+    """由关节角算 TCP（与 backend/internal/robot/kinematics.go 的 FK 同一套公式）。
+
+    坐标/几何**全部取自 caps**，本文件不持任何尺寸常量 —— 外部项目就该怎么用。
+    """
+    b = math.radians(pose.get("base", 0.0))
+    s = math.radians(pose.get("shoulder", 0.0))
+    e = math.radians(pose.get("elbow", 0.0))
+    r = geom["l1"] * math.sin(s) + geom["l2"] * math.sin(e) + geom["toolR"]
+    z = geom["pivotZ"] + geom["l1"] * math.cos(s) + geom["l2"] * math.cos(e)
+    return [r * math.cos(b), r * math.sin(b), z]
+
+
+def limb_pose(joints: list[dict], frac: float) -> dict:
+    """取各定位关节限位的 frac 处 —— 构造出来的**合法**位姿（可达性由此保证）。"""
+    out = {}
+    for j in joints:
+        if j.get("id") in ("base", "shoulder", "elbow"):
+            out[j["id"]] = j["min"] + (j["max"] - j["min"]) * frac
+    return out
+
+
+def near(got: list[float] | None, want: list[float], tol: float = 0.5) -> bool:
+    if not got or len(got) != len(want):
+        return False
+    return all(abs(got[i] - want[i]) <= tol for i in range(len(want)))
+
+
+def fmt3(v: list[float] | None) -> str:
+    return "-" if v is None else "(" + ", ".join(f"{x:.2f}" for x in v) + ")"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -198,6 +233,83 @@ def main(argv: list[str] | None = None) -> int:
         c2 = Client(args.host, args.port)
         r = c2.send({"cmd": "gripper", "action": "close"})
         check("超长行不影响其它客户端", r.get("ok") is True, r.get("error", ""))
+        # ---- ⑦ XYZ 矢量命令（v2）--------------------------------------
+        #
+        # ★ 目标点**不写死坐标**：先拿 caps 的几何与限位，再按 Go 测试同一套构造
+        #   （取定位关节限位 30% / 40% 处的合法位姿 → FK）算出两个可达点。
+        #   "可达"于是是构造出来的事实，不是凭手感挑的数字；顺带也证明了
+        #   caps 真能拿来映射坐标 —— 那正是它存在的理由。
+        print()
+        print("── ⑦ XYZ 矢量命令：movexyz / moveto / home ────")
+        cap_r = c2.send({"cmd": "caps"})
+        caps = cap_r.get("caps") or {}
+        check("caps 返回能力描述", isinstance(caps, dict) and (caps.get("protocol") or 0) >= 2,
+              f"protocol={caps.get('protocol')} commands={len(caps.get('commands') or [])}")
+
+        if not caps:
+            check("XYZ 矢量命令（依赖 caps）", False, "caps 没返回，后续用例跳过")
+        else:
+            geom = caps.get("geom") or {}
+            joints = caps.get("joints") or []
+            target_a = fk(limb_pose(joints, 0.30), geom)
+            target_b = fk(limb_pose(joints, 0.40), geom)
+
+            r = c2.send({"cmd": "moveto", "xyz": target_a})
+            got = (r.get("state") or {}).get("tcp") if r.get("ok") else None
+            check("moveto 绝对定位到 A", r.get("ok") is True and near(got, target_a),
+                  f"tcp={fmt3(got)} 期望 {fmt3(target_a)} {r.get('error', '')}")
+
+            delta = [target_b[i] - target_a[i] for i in range(3)]
+            nonzero = sum(1 for d in delta if abs(d) > 1e-6)
+            r = c2.send({"cmd": "movexyz", "delta": delta})
+            got = (r.get("state") or {}).get("tcp") if r.get("ok") else None
+            check("movexyz 三轴同时位移 A→B", nonzero >= 2 and r.get("ok") is True and near(got, target_b),
+                  f"Δ={fmt3(delta)}({nonzero} 个非零分量) → tcp={fmt3(got)} 期望 {fmt3(target_b)} "
+                  f"{r.get('error', '')}")
+
+            # 绝对语义：再发一次同一点必须**停在原地**（若被当成相对量会继续走）。
+            r = c2.send({"cmd": "moveto", "xyz": target_a})
+            got = (r.get("state") or {}).get("tcp") if r.get("ok") else None
+            check("moveto 幂等（绝对而非相对）", r.get("ok") is True and near(got, target_a),
+                  f"tcp={fmt3(got)} 期望 {fmt3(target_a)} {r.get('error', '')}")
+
+            far = [0.0, 0.0, geom.get("pivotZ", 0) + geom.get("l1", 0) + geom.get("l2", 0) + 200.0]
+            r = c2.send({"cmd": "moveto", "xyz": far})
+            check("不可达点被拒（OUT_OF_WORKSPACE）",
+                  r.get("ok") is False and "OUT_OF_WORKSPACE" in (r.get("error") or ""),
+                  f"ok={r.get('ok')} error={r.get('error')!r}")
+
+            r = c2.send({"cmd": "home"})
+            home_tcp = (r.get("state") or {}).get("tcp") if r.get("ok") else None
+            check("home 归位到 HOME", r.get("ok") is True and near(home_tcp, fk(caps.get("home") or {}, geom)),
+                  f"tcp={fmt3(home_tcp)} 期望 {fmt3(fk(caps.get('home') or {}, geom))}")
+
+            # caps 自身：数量与包含关系（外部项目拿它做钳位，错了会很安静）。
+            ws = caps.get("workspace") or {}
+            wsmin, wsmax = ws.get("min") or [], ws.get("max") or []
+            check("caps 关节/舵机条目齐全", len(joints) == 4 and len(caps.get("servos") or []) == 4,
+                  f"joints={len(joints)} servos={len(caps.get('servos') or [])}")
+            check("caps workspace 包围盒有效",
+                  len(wsmin) == 3 and len(wsmax) == 3 and all(wsmin[i] < wsmax[i] for i in range(3)),
+                  f"min={fmt3(wsmin)} max={fmt3(wsmax)}")
+            check("caps 可达壳 = L1±L2",
+                  abs((geom.get("reachMax") or 0) - (geom.get("l1", 0) + geom.get("l2", 0))) < 1e-9,
+                  f"reachMax={geom.get('reachMax')} l1+l2={geom.get('l1', 0) + geom.get('l2', 0)}")
+
+        # ---- ⑧ 矢量参数错误 -------------------------------------------
+        print()
+        print("── ⑧ 矢量参数错误：都要被拒 ───────────────────")
+        for name, line, want in [
+            ("缺 delta", '{"cmd":"movexyz"}', "missing delta"),
+            ("delta 只有两个数", '{"cmd":"movexyz","delta":[1,2]}', "invalid delta"),
+            ("delta 全零", '{"cmd":"movexyz","delta":[0,0,0]}', "invalid delta"),
+            ("缺 xyz", '{"cmd":"moveto"}', "missing xyz"),
+            ("xyz 只有两个数", '{"cmd":"moveto","xyz":[1,2]}', "invalid xyz"),
+        ]:
+            r = c2.send(line)
+            check(name, r.get("ok") is False and want in (r.get("error") or ""),
+                  f"ok={r.get('ok')} error={r.get('error')!r}")
+
         c2.close()
 
     finally:

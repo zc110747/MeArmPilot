@@ -168,6 +168,11 @@ MeArm-3D/
 │   ├── ARCHITECTURE_ANALYSIS.md  # ★ MuJoCo 轨 Phase 1：自由度清点 / 五种角度对照 / 接入方案
 │   ├── decisions.md              # 设计决策 ADR（**D1–D79，最新在前**；D55 = 真值冻结 · D63–D69 = 照片纹理与外观 · D70 = 被动腕关节 · D71–D73 = 基线冻结 / 最小抽象 / Sim2Sim 纪律 · D74 = 首次接管握手 · D75 = 配置选模型 + 分派收敛到一张表 · D76 = SO-101 的三条真值取舍 · **D77–D79 = 多机器人统一验收 / 运行期切换**）
 │   ├── serial-v1.md              # ★ 串口 / WS 协议基线（§4 固件侧；§5 上位机侧已实现）
+│   ├── protocol/                 # ★★ **对外控制协议**（给外部项目用，如 visionflow 手势控制）
+│   │   ├── README.md             #     总索引：传输 / 坐标系 / 命令总表 / 验收
+│   │   ├── tcp-v1.md             #     v1：move / gripper / servo / state
+│   │   ├── tcp-xyz-v2.md         #     v2：movexyz / moveto / home / caps（**XYZ 矢量**）
+│   │   └── gesture-control.md    #     手势控制接入指南（映射 / 钳位 / 节流 / 参考客户端）
 │   ├── texture-capture-guide.md  # ★ 图像采集指南（拍哪块板 / 大面朝向 / 采集闭环 / 自查清单）
 │   ├── architecture/             # ★★ 架构重构轨：MeArm-V1 基线冻结三件套（现状分析 / 验收结论 / 无关问题登记）
 │   │                             #   + so-arm101-phase0.md · robot-package-phase0.md · robot-package-phase1.md · robot-package-phase2.md

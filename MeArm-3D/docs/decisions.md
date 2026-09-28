@@ -3,7 +3,53 @@
 记录"为什么这么做"，尤其是**与原 spec 示例不一致**的地方，方便后续复盘与修改。
 每条都有编号，代码注释会引用编号（如 `D2`）。
 
-> 本文**最新条目在前**（D84 在最上，D1 在最下）。
+> 本文**最新条目在前**（D85 在最上，D1 在最下）。
+
+## D85 · TCP v2：加 XYZ 矢量命令时，把「旧命令没被改坏」当成唯一的红线
+
+**背景**：visionflow 要做手势控制，需要"三轴同时变化"的接口。v1 的 `move` 一次
+只能动一个轴；发三条 `move` 顶不上一条矢量命令 —— 三次「读当前 → IK → Apply」里
+第二次的基准已是第一次下发后的命令值，串行叠加在**限位边界附近**会逐步走到一个
+单次直达不会选的分支（2R 有 elbow-up / down 两支，`nearest` 选支依赖当前姿态）。
+
+**决策**：v2 **只新增**四条命令，不改 v1 任何一个字节。
+
+| 命令 | 语义 |
+|------|------|
+| `movexyz` | 三轴同时相对位移 `delta:[dx,dy,dz]` |
+| `moveto` | **绝对**目标点 `xyz:[x,y,z]`（v1 §8 曾列为 v2） |
+| `home` | 回 `robot.yaml` 的 `homePose` |
+| `caps` | 只读：几何 / 限位 / 行程 / 可达包围盒 |
+
+**为什么 `move` 也走同一条 `applyTarget` 尾巴**：单轴 `move` 与 `movexyz` 单轴分量
+本就该逐位一致。但"收敛"是最容易顺手改坏旧行为的一步，所以配一条**等价性判据**
+`TestMove_SingleAxisEqualsMoveXYZ`（六个方向逐位比下发关节角与 `state.tcp`），
+另配 `TestV1Commands_UnchangedAfterV2` 盯住 v1 的错误优先级
+（非法 `axis` 必须先于缺 `step` 报出来）。
+`move` 的参数校验**刻意留在原地**、全部先于取快照，就是为了保住这个顺序。
+
+**为什么要有 `caps`**：外部项目要把"手的归一化坐标"映射到 mm，就必须知道可达范围与
+限位。不给它这些，它只能把边界抄进自己的代码 —— 那立刻是**第二份真值**。
+`caps` 的每个数字都由 `robot.yaml` 派生，判据
+`TestCaps_DerivesFromModelTruth` 逐项对账。
+
+⚠️ 两个**故意不对称**的规则，别在后续改动里"顺手统一"掉：
+
+1. `movexyz` 的**全零 delta 是参数错误**（与 v1 `move` 的 `step > 0` 同源），
+   错误文本点明 `zero displacement` —— 手势静止帧应当**跳过**，不当故障。
+2. `moveto` 的 `[0,0,0]` 是**合法目标点**，不可达该由 `OUT_OF_WORKSPACE` /
+   `JOINT_LIMIT` 说，不能被参数校验当成"坐标格式不对"。
+
+**`caps.workspace` 是外边界，不是可达域**：它由关节限位**采样 FK** 求出
+（`workspaceSamples=12`），可达域是被限位切过的甜甜圈壳层，**盒内仍可能不可达**。
+用途只做粗钳位，真正的判据永远是命令的 `ok`。
+
+**协议文档**：整理到 `docs/protocol/`（README 总索引 + tcp-v1 + tcp-xyz-v2 +
+gesture-control）。旧 `docs/tcp-control-v1.md` 只留跳转指针 —— 协议只有一份真值。
+
+**判据（现跑现取）**：`go test ./internal/tcpserver/` 28 项 PASS ·
+`tcp_control_client.py` **42/42** · `gesture_bridge.py --demo` 7 项 PASS ·
+既有的 `verify_external_origin.mjs` 仍 3 PASS / 0 FAIL。
 
 ## D84 · 新增 `origin=external`：让「另一台上位机在驱动」被对端页面正确跟随
 

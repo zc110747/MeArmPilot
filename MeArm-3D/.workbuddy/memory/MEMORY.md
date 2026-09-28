@@ -83,6 +83,7 @@
 |---|---|
 | §1 测试/探针纪律 · §2 机制与关节判定（轴/nq=5/绝对角/斜合法域） · §3 外观·纹理轨（D56–D69） · §4 测量方法论与能力边界 · §5 运行环境与 Windows/沙箱陷阱 · §6 协作约定与真机链路 | `playbook.md` §1–§6 |
 | §7 多机器人轨 · §8 Robot Package 重构边界与搬迁纪律 | `playbook.md` §7 · §8 · `docs/architecture/robot-package-phase*.md` |
+| **对外控制协议**（外部项目唯一的协议真值，visionflow 手势控制对接它） | `docs/protocol/`：README 总索引 · `tcp-v1.md` · `tcp-xyz-v2.md`（v2 XYZ 矢量） · `gesture-control.md`。ADR **D85** |
 | §9 `start.bat` + 真机验收两条证据链 · §11 验收七件套全文 | `playbook.md` §9 · §11 |
 | §10 CAD/STEP 接入（OCCT 铁律/平行四连杆实证） | `playbook.md` §10 · `docs/STEP_KINEMATICS_VALIDATION.md` |
 | §12 固件链路诊断（独立计数器 / 复位吞命令双窗口 / `STATS`） | `playbook.md` §12 |

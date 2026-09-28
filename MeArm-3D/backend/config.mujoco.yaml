@@ -28,7 +28,8 @@ web:
   client_timeout_ms: 40000
 
 # TCP JSON Lines 控制接口（第四个入口，与 HTTP / WebSocket 并行）。
-# 协议与命令见 docs/tcp-control-v1.md。
+# 协议与命令见 docs/protocol/（README.md = 总索引；tcp-v1.md = v1 四命令；
+# tcp-xyz-v2.md = XYZ 矢量命令 movexyz / moveto / home / caps）。
 tcp:
   enabled: true
   host: "0.0.0.0"
